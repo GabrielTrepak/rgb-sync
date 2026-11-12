@@ -28,6 +28,25 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
 > Se usar Wallpaper Engine, desligue o plugin de LED dele (Configurações → Plugins → LED)
 > para ele não disputar o iCUE com o RGB Sync.
 
+- **Efeito** — Corsair e teclado animados pelo app (20 quadros/s, LED a LED); placa-mãe e GPU
+  usam o efeito nativo da MSI com a mesma cor/velocidade (ela leva ~0,6 s por mudança):
+  - **Respiração**: a cor escolhida acende e apaga (lenta / média / rápida);
+  - **Onda**: arco-íris correndo da esquerda pra direita nas fans, RAM e teclado;
+  - **Ciclo**: tudo passa junto por todas as cores;
+  - **Temperatura**: azul (frio) → vermelho (quente), pela **temperatura da GPU** (NVML, direto
+    do driver NVIDIA, 35–85 °C) ou pelo **uso da CPU** (0–100%). A temperatura da CPU exigiria
+    um driver de baixo nível, que o projeto evita de propósito.
+
+## Controle externo (Stream Deck, scripts)
+
+```powershell
+python rgbsync_cmd.py perfil Noite
+python rgbsync_cmd.py modo efeito        # papel | fixo | efeito
+python rgbsync_cmd.py efeito onda        # respiracao | onda | ciclo | temperatura
+python rgbsync_cmd.py cor ff0000
+python rgbsync_cmd.py brilho 40
+```
+
 ## Aba Perfis
 
 - **Perfil** = modo, cor, brilho, monitor e quais aparelhos ficam ligados. Vêm três prontos
@@ -89,6 +108,8 @@ No iCUE, o SDK precisa estar ativado.
 - `rgb_core.py` — backends Corsair, MSI e teclado HyperX
 - `hyperx.py` — protocolo e mapa de teclas (ANSI/ABNT2) do Alloy Origins Core (`python hyperx.py` testa)
 - `papel_parede.py` — captura do papel de parede e cor por LED
+- `efeitos.py` — efeitos (cálculo por LED, estilos nativos da MSI) e sensores (GPU/CPU)
+- `rgbsync_cmd.py` — controle externo do app que está rodando
 - `perfis.py` — perfis, atalhos globais (RegisterHotKey) e vigia de programas
 - `busca.py` — procura equipamentos RGB USB (`python busca.py` testa)
 - `icone.py` — gera o ícone da fogueira (`assets/`); o da bandeja tem o núcleo na cor atual

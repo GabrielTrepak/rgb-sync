@@ -267,6 +267,7 @@ class MSI:
             return False
         self.dispositivos = []
         self.nomes_led = {}
+        self.estilos_disp = {}
         if self.dll is None:
             os.add_dll_directory(os.path.dirname(MLAPI_DLL))
         d = ctypes.WinDLL(MLAPI_DLL)
@@ -278,6 +279,8 @@ class MSI:
         d.MLAPI_GetLedStyle.argtypes = [c_void_p, c_ulong, P]
         d.MLAPI_SetLedColor.argtypes = [c_void_p, c_ulong, c_ulong, c_ulong, c_ulong]
         d.MLAPI_SetLedStyle.argtypes = [c_void_p, c_ulong, c_void_p]
+        d.MLAPI_SetLedSpeed.argtypes = [c_void_p, c_ulong, c_ulong]
+        d.MLAPI_GetLedMaxSpeed.argtypes = [c_void_p, c_ulong, POINTER(c_ulong)]
         self.dll = d
 
         r = d.MLAPI_Initialize()
@@ -303,6 +306,7 @@ class MSI:
                 disponiveis = _ler_safearray(lista)
                 fixo = next((e for e in ESTILOS_FIXOS if e in disponiveis), None)
                 estilos[i] = fixo
+                self.estilos_disp[(tipo, i)] = disponiveis
                 self.nomes_led.setdefault(tipo, []).append(nome_led)
                 log.info("MSI: %s[%d] '%s' estilos=%s -> fixo=%s",
                          tipo, i, nome_led, disponiveis, fixo)
@@ -348,6 +352,29 @@ class MSI:
             pior = min(min(c) for c in codigos) if codigos else 0
             res[NOMES_MSI.get(tipo, tipo)] = MLAPI_ERROS.get(pior, pior)
             log.info("MSI aplicar %s #%02x%02x%02x -> %s", tipo, r, g, b, codigos)
+        return res
+
+    def aplicar_efeito(self, preferidos, r, g, b, nivel):
+        """Efeito NATIVO da MSI (ela mesma anima, sem travar o app).
+        preferidos: {"MSI_MB": [estilos...], "MSI_VGA": [...]} — usa o primeiro que a
+        zona tiver; nivel: velocidade de 0 (lenta) a 1 (rápida)."""
+        res = {}
+        for tipo, n, estilos in self.dispositivos:
+            if f"msi:{tipo}" in self.desligados:
+                continue
+            codigos = []
+            for i in range(n):
+                disp = self.estilos_disp.get((tipo, i), [])
+                estilo = next((e for e in preferidos.get(tipo, []) if e in disp), estilos[i])
+                bt = _bstr(tipo)
+                rs, rc = self._set(tipo, i, estilo, r, g, b)
+                mx = c_ulong(0)
+                self.dll.MLAPI_GetLedMaxSpeed(bt, i, byref(mx))
+                vel = self.dll.MLAPI_SetLedSpeed(bt, i, round(nivel * mx.value)) if mx.value else 0
+                _oa.SysFreeString(bt)
+                codigos.append((estilo, rs, rc, vel))
+            res[NOMES_MSI.get(tipo, tipo)] = codigos
+        log.info("MSI efeito #%02x%02x%02x nivel=%.1f -> %s", r, g, b, nivel, res)
         return res
 
     def restaurar(self):
@@ -545,6 +572,9 @@ class Controlador:
                 self.ativos.append(b)
             status[b.nome] = "ok" if ok else b.erro
         return status
+
+    def msi(self):
+        return next((b for b in self.ativos if isinstance(b, MSI)), None)
 
     def corsair(self):
         return next((b for b in self.ativos if isinstance(b, Corsair)), None)

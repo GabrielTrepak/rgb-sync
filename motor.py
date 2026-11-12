@@ -20,6 +20,7 @@ import time
 
 from PIL import ImageChops, ImageStat
 
+import efeitos
 from papel_parede import Capturador, cor_para_leds, cores_por_led, preparar_layout
 from rgb_core import DADOS, Controlador, _pasta_appdata, log
 
@@ -29,7 +30,8 @@ RETENTATIVAS = 18            # 18 x 10 s = 3 min tentando conectar no boot
 TAREFA = "RGB Sync"
 SEM_JANELA = subprocess.CREATE_NO_WINDOW
 
-PADRAO = {"modo": "papel_parede", "monitor": "principal", "cor": "#0050ff", "brilho": 100}
+PADRAO = {"modo": "papel_parede", "monitor": "principal", "cor": "#0050ff", "brilho": 100,
+          "efeito": "respiracao", "velocidade": "media", "fonte_temp": "gpu"}
 
 
 # ============================================================= configuração
@@ -81,7 +83,7 @@ def pedir_para_sair():
         return False
 
 
-def ouvir_outras_copias(ao_mostrar, ao_sair=None):
+def ouvir_outras_copias(ao_mostrar, ao_sair=None, ao_comando=None):
     srv = socket.socket()
     srv.bind(("127.0.0.1", PORTA_UNICA))
     srv.listen(1)
@@ -90,13 +92,15 @@ def ouvir_outras_copias(ao_mostrar, ao_sair=None):
         while True:
             conn, _ = srv.accept()
             with conn:
-                msg = conn.recv(16)
+                msg = conn.recv(256)
                 if msg == b"mostrar":
                     ao_mostrar()
                 elif msg == b"sair" and ao_sair:
                     ao_sair()
                 elif msg.startswith(b"aba:") and ao_mostrar:   # abre numa aba (atalhos/testes)
                     ao_mostrar(msg[4:].decode("utf-8", "replace"))
+                elif msg.startswith(b"cmd:") and ao_comando:   # controle externo
+                    ao_comando(msg[4:].decode("utf-8", "replace"))
                 elif msg == b"diag":                     # diagnóstico local
                     import logging
                     info = {"pid": os.getpid(), "exe": sys.executable, "dados": CONFIG,
@@ -266,6 +270,8 @@ class Trabalhador(threading.Thread):
     GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
     LIMIAR_GERAL = 20
     PREVIEW_A_CADA = 0.2      # s, prévia dos LEDs na janela (só com a janela aberta)
+    FPS_EFEITO = 20           # respiração / onda / ciclo
+    FPS_TEMPERATURA = 4       # a cor da temperatura muda devagar
 
     def __init__(self, ao_status, desligados=()):
         super().__init__(daemon=True)
@@ -290,9 +296,23 @@ class Trabalhador(threading.Thread):
         self._primeiro = False
         self._forcar_envio = True
         self._preview_t = 0.0
+        self.efeito = None            # {"tipo", "cor", "velocidade", "brilho", "fonte"} ou None
+        self._efeito_msi = None       # parâmetros do efeito nativo já enviado à MSI
+        self._efeito_t0 = time.monotonic()
+        self._sensores = None
+        self._temp_suave = None
+        self._temp_msi = None
+        self._temp_msi_t = 0.0
 
     # ---- comandos vindos da interface (thread da interface)
+    def ativar_efeito(self, params):
+        """params: {"tipo", "cor": (r, g, b), "velocidade", "brilho", "fonte"}."""
+        self.papel = None
+        self.efeito = dict(params)
+        self.fila.put(("acordar", None))
+
     def ativar_papel(self, monitor, brilho):
+        self.efeito = None
         self.papel = {"monitor": monitor, "brilho": brilho}
         self._geral_t = 0.0
         self._geral_enviada = None
@@ -316,6 +336,7 @@ class Trabalhador(threading.Thread):
 
     def cor_fixa(self, rgb):
         self.papel = None
+        self.efeito = None
         self.fila.put(("cor", rgb))
 
     def desligar_dispositivos(self, chaves):
@@ -328,6 +349,8 @@ class Trabalhador(threading.Thread):
         """Manda tudo de novo (depois de recarregar ou (des)ligar aparelhos)."""
         self._layouts_de = None
         self._img_anterior = None
+        self._efeito_msi = None
+        self._temp_msi = None
         if self.papel:
             self._forcar_envio = True
             self._parado = 0
@@ -348,7 +371,10 @@ class Trabalhador(threading.Thread):
             lento = bool(self._cap and self._cap.lento)
             fps = self.FPS_CENA if lento else self.FPS
             fps_parado = self.FPS_CENA_PARADO if lento else self.FPS_PARADO
-            if not self.papel:
+            if self.efeito:
+                espera = 1 / (self.FPS_TEMPERATURA if self.efeito["tipo"] == "temperatura"
+                              else self.FPS_EFEITO)
+            elif not self.papel:
                 espera = 10
             elif self._parado >= fps:
                 espera = 1 / fps_parado
@@ -357,7 +383,9 @@ class Trabalhador(threading.Thread):
             try:
                 cmd, arg = self.fila.get(timeout=espera)
             except queue.Empty:
-                if self.papel:
+                if self.efeito:
+                    self._quadro_efeito()
+                elif self.papel:
                     self._parado = self._parado + 1 if self._quadro() else 0
                 # No boot o iCUE pode subir depois do app: tenta de novo a cada 10 s.
                 if (any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS
@@ -412,6 +440,84 @@ class Trabalhador(threading.Thread):
         msi = [(d["nome"].split(" (")[0], d["chave"], d["ativo"])
                for d in self.ctrl.listar() if d["marca"] == "MSI"]
         self.ao_status("layouts", {"corsair": lista, "msi": msi, "teclado": teclado})
+
+    # ---- efeitos
+    def _garantir_layouts(self, backends):
+        assinatura = tuple(id(be.posicoes) for be in backends)
+        if self._layouts_de != assinatura:
+            self._layouts = {d: (be, preparar_layout(pos)) for be in backends
+                             for d, (_, pos) in be.posicoes.items() if pos}
+            self._layouts_de = assinatura
+            self._suave, self._enviado = {}, {}
+
+    def _quadro_efeito(self):
+        ef = self.efeito
+        if not ef:
+            return
+        try:
+            tipo, vel = ef["tipo"], ef["velocidade"]
+            k = ef["brilho"] / 100
+            t = time.monotonic() - self._efeito_t0
+            valor_n, texto = 0.0, None
+            if tipo == "temperatura":
+                if self._sensores is None:
+                    self._sensores = efeitos.Sensores()
+                v = self._sensores.ler(ef["fonte"])
+                alvo = efeitos.normalizar(ef["fonte"], v)
+                self._temp_suave = alvo if self._temp_suave is None else \
+                    self._temp_suave + (alvo - self._temp_suave) * 0.15
+                valor_n, texto = self._temp_suave, self._sensores.texto(ef["fonte"])
+
+            # Corsair + teclado: quadro a quadro, LED a LED
+            backends = self.ctrl.por_led()
+            self._garantir_layouts(backends)
+            mapas = {}
+            for dev_id, (be, (ncol, _nlin, leds)) in self._layouts.items():
+                if not be.ativo(dev_id):
+                    continue
+                lista = []
+                for led_id, c, _l in leds:
+                    x = c / (ncol - 1) if ncol > 1 else 0.5
+                    cor = efeitos.cor_led(tipo, t, x, ef["cor"], vel, valor_n)
+                    final = tuple(round(min(255, c_) * k) for c_ in cor)
+                    lista.append((led_id, final))
+                    self._enviado[(dev_id, led_id)] = final
+                mapas.setdefault(be, {})[dev_id] = lista
+            for be, mapa in mapas.items():
+                be.aplicar_por_led(mapa)
+
+            # MSI: efeito nativo (uma vez) ou cor da temperatura (só quando muda)
+            if tipo == "temperatura":
+                cor = tuple(round(c * k) for c in efeitos.cor_temperatura(valor_n))
+                agora = time.monotonic()
+                if (self._temp_msi is None or (agora - self._temp_msi_t > 2 and
+                        max(abs(a - b) for a, b in zip(cor, self._temp_msi)) > 12)):
+                    self._temp_msi, self._temp_msi_t = cor, agora
+                    self._efeito_msi = None
+                    self.ctrl.aplicar(*cor, so_msi=True)
+                    self.ao_status("efeito_msi", rgb_hex(cor))
+            else:
+                chave = (tipo, vel, ef["cor"], ef["brilho"])
+                if self._efeito_msi != chave and self.ctrl.msi():
+                    self._efeito_msi = chave
+                    self._temp_msi = None
+                    mb, vga = efeitos.ESTILOS_MSI[tipo]
+                    cor = tuple(round(c * k) for c in ef["cor"])
+                    self.ctrl.msi().aplicar_efeito({"MSI_MB": mb, "MSI_VGA": vga}, *cor,
+                                                   efeitos.NIVEL_VEL[vel])
+                    self.ao_status("efeito_msi", rgb_hex(cor) if tipo == "respiracao"
+                                   else "arco-íris")
+
+            agora = time.monotonic()
+            if self.preview_ligado and agora - self._preview_t >= self.PREVIEW_A_CADA:
+                self._preview_t = agora
+                self.ao_status("preview", dict(self._enviado))
+                if texto:
+                    self.ao_status("sensor", texto)
+        except Exception:
+            if time.monotonic() - self._erro_t > 30:
+                self._erro_t = time.monotonic()
+                log.exception("falha no quadro do efeito")
 
     # ---- modo papel de parede
     def _quadro(self):

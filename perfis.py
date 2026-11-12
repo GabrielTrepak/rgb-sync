@@ -16,7 +16,8 @@ from ctypes import wintypes as W
 
 from rgb_core import log
 
-CAMPOS = ("modo", "cor", "brilho", "monitor", "desligados")
+CAMPOS = ("modo", "cor", "brilho", "monitor", "desligados", "efeito", "velocidade",
+          "fonte_temp")
 
 PADROES = {
     "Jogo": {"modo": "papel_parede", "cor": "#0050ff", "brilho": 100, "monitor": "principal",

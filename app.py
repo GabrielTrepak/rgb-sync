@@ -24,13 +24,14 @@ import pystray
 from PIL import Image
 
 import busca
+import efeitos
 import motor
 import perfis
 from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.3"
+VERSAO = "3.4"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -52,7 +53,7 @@ DESTAQUE_HOVER = "#f07a36"
 OK, ALERTA = "#3ddc84", "#ffb74d"
 CINZA_OFF = "#2b282e"
 
-MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo"}
+MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo", "Efeito": "efeito"}
 MONITORES = {"Principal": "principal", "Secundário": "secundario", "Os dois": "ambos"}
 ABAS = ("Iluminação", "Perfis", "Dispositivos")
 LARGURA = 452
@@ -214,7 +215,8 @@ class App:
         self.icon.run_detached()
 
         motor.ouvir_outras_copias(lambda aba=None: root.after(0, self.mostrar, aba),
-                                  lambda: root.after(0, self.sair))
+                                  lambda: root.after(0, self.sair),
+                                  lambda cmd: root.after(0, self.comando, cmd))
         root.protocol("WM_DELETE_WINDOW", self.esconder)
         root.bind("<Map>", lambda e: self._visivel(True))
         root.bind("<Unmap>", lambda e: self._visivel(False))
@@ -364,6 +366,47 @@ class App:
                       text_color=SUAVE, font=("Segoe UI", 12),
                       command=lambda: self.definir("#000000")).pack(side="right", padx=8)
 
+        # efeito
+        self.c_efeito = self._cartao(p)
+        le = ctk.CTkFrame(self.c_efeito, fg_color="transparent")
+        le.pack(fill="x", padx=16, pady=(12, 6))
+        self.seg_efeito = self._segmentado(le, list(efeitos.TIPOS), self._mudar_efeito)
+        self.seg_efeito.set(_nome(efeitos.TIPOS, self.cfg["efeito"]))
+        self.seg_efeito.pack(fill="x")
+        lv = ctk.CTkFrame(self.c_efeito, fg_color="transparent")
+        lv.pack(fill="x", padx=16, pady=(4, 6))
+        ctk.CTkLabel(lv, text="Velocidade", text_color=TEXTO, font=("Segoe UI", 13)).pack(
+            side="left")
+        self.seg_vel = self._segmentado(lv, list(efeitos.VELOCIDADES), self._mudar_vel)
+        self.seg_vel.set(_nome(efeitos.VELOCIDADES, self.cfg["velocidade"]))
+        self.seg_vel.pack(side="right")
+        # cor (respiração)
+        self.l_ef_cor = ctk.CTkFrame(self.c_efeito, fg_color="transparent")
+        ctk.CTkLabel(self.l_ef_cor, text="Cor", text_color=TEXTO, font=("Segoe UI", 13)).pack(
+            side="left")
+        self._botao(self.l_ef_cor, "Escolher…", self.escolher_cor_efeito, width=90).pack(
+            side="right")
+        self.amostra_ef = ctk.CTkFrame(self.l_ef_cor, width=28, height=28, corner_radius=8,
+                                       fg_color=self.cfg["cor"])
+        self.amostra_ef.pack(side="right", padx=8)
+        for _n, cor in reversed(PRESETS[:7]):
+            ctk.CTkButton(self.l_ef_cor, text="", width=22, height=22, corner_radius=11,
+                          fg_color=cor, hover_color=cor,
+                          command=lambda c=cor: self.cor_efeito(c)).pack(side="right", padx=2)
+        # fonte (temperatura)
+        self.l_ef_fonte = ctk.CTkFrame(self.c_efeito, fg_color="transparent")
+        self.seg_fonte = self._segmentado(self.l_ef_fonte, list(efeitos.FONTES),
+                                          self._mudar_fonte)
+        self.seg_fonte.set(_nome(efeitos.FONTES, self.cfg["fonte_temp"]))
+        self.seg_fonte.pack(side="left")
+        self.lbl_sensor = ctk.CTkLabel(self.l_ef_fonte, text="", text_color=SUAVE,
+                                       font=("Segoe UI Semibold", 13))
+        self.lbl_sensor.pack(side="right")
+        self.lbl_ef_info = ctk.CTkLabel(self.c_efeito, text="", text_color=SUAVE,
+                                        font=("Segoe UI", 10), justify="left",
+                                        wraplength=LARGURA - 40)
+        self.lbl_ef_info.pack(anchor="w", padx=16, pady=(0, 10))
+
         # brilho
         cb = self._cartao(p)
         lb = ctk.CTkFrame(cb, fg_color="transparent")
@@ -443,6 +486,9 @@ class App:
         self.amostra.configure(fg_color=self.cfg["cor"])
         self.ent_hex.delete(0, "end")
         self.ent_hex.insert(0, self.cfg["cor"].upper())
+        self.seg_efeito.set(_nome(efeitos.TIPOS, self.cfg["efeito"]))
+        self.seg_vel.set(_nome(efeitos.VELOCIDADES, self.cfg["velocidade"]))
+        self.seg_fonte.set(_nome(efeitos.FONTES, self.cfg["fonte_temp"]))
         self._atualizar_modo()
         if self.pronto:
             self.trab.desligar_dispositivos(set(self.cfg["desligados"]))
@@ -559,7 +605,11 @@ class App:
             anchor="w", padx=16, pady=10)
 
     def _resumo_perfil(self, p):
-        if p["modo"] == "papel_parede":
+        if p["modo"] == "efeito":
+            txt = "Efeito: " + _nome(efeitos.TIPOS, p.get("efeito", "respiracao"))
+            if p.get("efeito") == "temperatura":
+                txt += " (" + ("GPU" if p.get("fonte_temp", "gpu") == "gpu" else "CPU") + ")"
+        elif p["modo"] == "papel_parede":
             txt = f"Papel de parede ({_nome(MONITORES, p.get('monitor', 'principal')).lower()})"
         else:
             txt = "Cor fixa" if p["cor"] != "#000000" else "Apagado"
@@ -809,6 +859,8 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Papel de parede", ui(self._mudar_modo, "Papel de parede"),
                              checked=lambda i: self.cfg["modo"] == "papel_parede", radio=True),
+            pystray.MenuItem("Efeito", ui(self._mudar_modo, "Efeito"),
+                             checked=lambda i: self.cfg["modo"] == "efeito", radio=True),
             pystray.MenuItem("Cor fixa", ui(self._mudar_modo, "Cor fixa"),
                              checked=lambda i: self.cfg["modo"] == "fixo", radio=True),
             pystray.MenuItem("Perfis", pystray.Menu(lambda: tuple(
@@ -831,16 +883,18 @@ class App:
         self.icon.update_menu()
 
     def _atualizar_modo(self):
-        papel = self.cfg["modo"] == "papel_parede"
-        self.c_papel.pack_forget()
-        self.c_fixo.pack_forget()
-        (self.c_papel if papel else self.c_fixo).pack(fill="x", padx=16, pady=(0, 10),
-                                                       after=self.card_previa)
-        if papel:
+        modo = self.cfg["modo"]
+        for c in (self.c_papel, self.c_fixo, self.c_efeito):
+            c.pack_forget()
+        alvo = {"papel_parede": self.c_papel, "fixo": self.c_fixo}.get(modo, self.c_efeito)
+        alvo.pack(fill="x", padx=16, pady=(0, 10), after=self.card_previa)
+        if modo == "papel_parede":
             self.lbl_fonte.configure(text="Lendo o papel de parede…")
             self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
-        else:
+        elif modo == "fixo":
             self.previa.tudo(self._hex_com_brilho(self.cfg["cor"]))
+        else:
+            self._atualizar_efeito_ui()
         if hasattr(self, "icon"):
             self.icon.icon = self._img_bandeja()
 
@@ -883,9 +937,91 @@ class App:
         if hexa:
             self.definir(hexa)
 
+    def comando(self, texto):
+        """Controle externo (Stream Deck, scripts): python rgbsync_cmd.py perfil Noite
+        Aceita: "perfil <nome>", "modo papel|fixo|efeito", "efeito <tipo>",
+        "cor #rrggbb", "brilho <0-100>"."""
+        verbo, _, arg = texto.strip().partition(" ")
+        log.info("comando externo: %s", texto)
+        if verbo == "perfil":
+            self.aplicar_perfil(arg, "atalho")
+        elif verbo == "modo":
+            nome = {"papel": "Papel de parede", "fixo": "Cor fixa", "efeito": "Efeito"}.get(arg)
+            if nome:
+                self._mudar_modo(nome)
+        elif verbo == "efeito" and arg in efeitos.TIPOS.values():
+            self.cfg["modo"] = "efeito"
+            self.seg_modo.set("Efeito")
+            self.seg_efeito.set(_nome(efeitos.TIPOS, arg))
+            self.cfg["efeito"] = arg
+            self._atualizar_modo()
+            self.enviar()
+        elif verbo == "cor" and len(arg.lstrip("#")) == 6:
+            self.definir("#" + arg.lstrip("#").lower())
+        elif verbo == "brilho" and arg.isdigit():
+            self.sl_brilho.set(min(100, int(arg)))
+            self._mudar_brilho(min(100, int(arg)))
+
+    # ---- efeito
+    INFO_EFEITO = {
+        "respiracao": "A cor acende e apaga devagar em todos os aparelhos.",
+        "onda": "Um arco-íris corre da esquerda para a direita nas fans, RAM e teclado.",
+        "ciclo": "Todos os aparelhos passam juntos por todas as cores.",
+        "temperatura": "Azul = frio · verde · amarelo · vermelho = quente "
+                       "(GPU: 35 °C a 85 °C; CPU: 0% a 100% de uso).",
+    }
+
+    def _atualizar_efeito_ui(self):
+        tipo = self.cfg["efeito"]
+        self.l_ef_cor.pack_forget()
+        self.l_ef_fonte.pack_forget()
+        if tipo == "respiracao":
+            self.l_ef_cor.pack(fill="x", padx=16, pady=(2, 6), before=self.lbl_ef_info)
+        elif tipo == "temperatura":
+            self.l_ef_fonte.pack(fill="x", padx=16, pady=(2, 6), before=self.lbl_ef_info)
+        info = self.INFO_EFEITO[tipo]
+        if tipo != "temperatura":
+            info += "  Placa-mãe e GPU usam o efeito próprio da MSI."
+        self.lbl_ef_info.configure(text=info)
+        self.amostra_ef.configure(fg_color=self.cfg["cor"])
+        self.seg_vel.configure(state="disabled" if tipo == "temperatura" else "normal")
+
+    def _mudar_efeito(self, nome):
+        self.cfg["efeito"] = efeitos.TIPOS[nome]
+        self._atualizar_efeito_ui()
+        self.enviar()
+
+    def _mudar_vel(self, nome):
+        self.cfg["velocidade"] = efeitos.VELOCIDADES[nome]
+        self.enviar()
+
+    def _mudar_fonte(self, nome):
+        self.cfg["fonte_temp"] = efeitos.FONTES[nome]
+        self.lbl_sensor.configure(text="")
+        self.enviar()
+
+    def cor_efeito(self, hexa):
+        self.cfg["cor"] = hexa
+        self.amostra_ef.configure(fg_color=hexa)
+        self.amostra.configure(fg_color=hexa)
+        self.ent_hex.delete(0, "end")
+        self.ent_hex.insert(0, hexa.upper())
+        self.enviar()
+
+    def escolher_cor_efeito(self):
+        _, hexa = colorchooser.askcolor(color=self.cfg["cor"], title="Cor da respiração")
+        if hexa:
+            self.cor_efeito(hexa)
+
     def enviar(self):
         self._salvar()
         if not self.pronto:
+            return
+        if self.cfg["modo"] == "efeito":
+            self.trab.ativar_efeito({"tipo": self.cfg["efeito"], "cor": hex_rgb(self.cfg["cor"]),
+                                     "velocidade": self.cfg["velocidade"],
+                                     "brilho": self.cfg["brilho"],
+                                     "fonte": self.cfg["fonte_temp"]})
             return
         if self.cfg["modo"] == "papel_parede":
             p = self.trab.papel
@@ -971,8 +1107,13 @@ class App:
             self._atualizar_modo()
             self._visivel(self.root.state() != "withdrawn")
         elif tipo == "preview":
-            if self.cfg["modo"] == "papel_parede":
+            if self.cfg["modo"] in ("papel_parede", "efeito"):
                 self.previa.leds(dados)
+        elif tipo == "efeito_msi":
+            if self.cfg["modo"] == "efeito":
+                self.previa.zonas_msi(dados if dados.startswith("#") else "#6b5cff")
+        elif tipo == "sensor":
+            self.lbl_sensor.configure(text=f"agora: {dados}")
         elif tipo == "papel_cor":
             geral, fonte = dados
             self.cor_geral = rgb_hex(geral)

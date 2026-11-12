@@ -32,7 +32,7 @@ from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.5"
+VERSAO = "3.6"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -56,7 +56,7 @@ CINZA_OFF = "#2b282e"
 
 MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo", "Efeito": "efeito"}
 MONITORES = {"Principal": "principal", "Secundário": "secundario", "Os dois": "ambos"}
-ABAS = ("Iluminação", "Perfis", "Dispositivos")
+ABAS = ("Iluminação", "Gabinete", "Perfis", "Dispositivos")
 LARGURA = 452
 COR_SITUACAO = {"compativel": OK, "planejado": ALERTA, "nao": SUAVE}
 
@@ -239,6 +239,64 @@ class Previa(tk.Canvas):
             self.itemconfig(i, fill=hexa)
 
 
+class CanvasGabinete(tk.Canvas):
+    """Gabinete grande (aba Gabinete): fans e cooler como anéis de LED nos lugares reais,
+    com o nome da posição. Mostra as cores ao vivo ou as cores do "Identificar"."""
+
+    W = LARGURA - 40
+
+    def __init__(self, master):
+        super().__init__(master, width=self.W, height=int(self.W * gabinete.ALTURA) + 30,
+                         bg=CARTAO, highlightthickness=0, bd=0)
+        self.itens, self.por_sub, self.todos = {}, {}, []
+
+    def montar(self, gab):
+        self.delete("all")
+        self.itens, self.por_sub, self.todos = {}, {}, []
+        W, H, y0 = self.W, self.W * gabinete.ALTURA, 6
+        if not gab:
+            self.create_text(W / 2, 60, text="Nenhum hub iCUE LINK encontrado.", fill=SUAVE,
+                             font=("Segoe UI", 11))
+            self.configure(height=120)
+            return
+        self.create_rectangle(2, y0, W - 2, y0 + H, outline="#3a353d", width=2)
+        self.create_rectangle(W * 0.40, y0 + H * 0.22, W * 0.66, y0 + H * 0.80,
+                              outline="#2c282f", width=1)
+        self.create_text(W * 0.53, y0 + H * 0.51, text="placa-mãe", fill="#3a353d",
+                         font=("Segoe UI", 9))
+        self.create_text(8, y0 + H - 6, text="◀ trás", anchor="sw", fill=APAGADO,
+                         font=("Segoe UI", 9))
+        self.create_text(W - 8, y0 + H - 6, text="frente ▶", anchor="se", fill=APAGADO,
+                         font=("Segoe UI", 9))
+        for i, papel, leds in gab["desenho"]:
+            x, y, r, nome = gabinete.POSICOES[papel]
+            for led, lx, ly in leds:
+                cx, cy = lx * W, y0 + ly * H
+                it = self.create_oval(cx - 3.8, cy - 3.8, cx + 3.8, cy + 3.8, outline="",
+                                      fill="#333")
+                self.itens.setdefault((gab["dev_id"], led), []).append(it)
+                self.por_sub.setdefault(i, []).append(it)
+                self.todos.append(it)
+            # nome da posição dentro do anel
+            self.create_text(x * W, y0 + y * H, text=nome.split(" — ")[-1].replace(
+                "Cooler (bomba)", "cooler"), fill=SUAVE, font=("Segoe UI", 8))
+        self.configure(height=int(y0 + H + 10))
+
+    def leds(self, cores):
+        for chave, rgb in cores.items():
+            for it in self.itens.get(chave, ()):
+                self.itemconfig(it, fill=rgb_hex(rgb))
+
+    def tudo(self, hexa):
+        for it in self.todos:
+            self.itemconfig(it, fill=hexa)
+
+    def identificacao(self):
+        for i, its in self.por_sub.items():
+            for it in its:
+                self.itemconfig(it, fill=gabinete.CORES_ID[i % len(gabinete.CORES_ID)])
+
+
 class App:
     def __init__(self, root, iniciar_escondido):
         self.root = root
@@ -357,9 +415,11 @@ class App:
         self.seg_aba.pack(fill="x", padx=16, pady=(0, 10))
 
         self.pag_luz = ctk.CTkFrame(r, fg_color="transparent")
+        self.pag_gab = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_perf = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_disp = ctk.CTkFrame(r, fg_color="transparent")
         self._montar_luz(self.pag_luz)
+        self._montar_aba_gabinete(self.pag_gab)
         self._montar_perfis(self.pag_perf)
         self._montar_disp(self.pag_disp)
         self.pag_luz.pack(fill="x")
@@ -501,20 +561,6 @@ class App:
                      font=("Segoe UI", 11)).pack(anchor="w", padx=4)
 
         # outros equipamentos
-        self.c_gab = self._cartao(p, "Cooler e fans no gabinete")
-        lg = ctk.CTkFrame(self.c_gab, fg_color="transparent")
-        lg.pack(fill="x", padx=16, pady=(6, 2))
-        ctk.CTkLabel(lg, text="Diga onde fica cada um (cores do “Identificar”).",
-                     text_color=SUAVE, font=("Segoe UI", 10)).pack(side="left")
-        self.bt_ident = self._botao(lg, "Identificar (30 s)", self.identificar, width=130)
-        self.bt_ident.pack(side="right")
-        self.lista_gab = ctk.CTkFrame(self.c_gab, fg_color="transparent")
-        self.lista_gab.pack(fill="x", padx=12, pady=(4, 2))
-        ctk.CTkLabel(self.c_gab, text="Fans que o hub não reconhece (ex.: a RX120 traseira) não "
-                     "aparecem aqui e mantêm a luz padrão delas.", text_color=APAGADO,
-                     font=("Segoe UI", 10), wraplength=LARGURA - 40, justify="left").pack(
-            anchor="w", padx=16, pady=(0, 10))
-
         c2 = self._cartao(p, "Equipamentos RGB conectados")
         self.lista_outros = ctk.CTkFrame(c2, fg_color="transparent")
         self.lista_outros.pack(fill="x", padx=12, pady=(4, 2))
@@ -763,7 +809,7 @@ class App:
 
     # ================================================================ abas
     def _mudar_aba(self, nome):
-        paginas = dict(zip(ABAS, (self.pag_luz, self.pag_perf, self.pag_disp)))
+        paginas = dict(zip(ABAS, (self.pag_luz, self.pag_gab, self.pag_perf, self.pag_disp)))
         for pg in paginas.values():
             pg.pack_forget()
         paginas.get(nome, self.pag_luz).pack(fill="x", before=self.rodape)
@@ -832,11 +878,34 @@ class App:
     # ---- gabinete
     NOMES_TIPO = {9: "Cooler (bomba)", 12: "Fan QX"}
 
+    def _montar_aba_gabinete(self, p):
+        topo = ctk.CTkFrame(p, fg_color="transparent")
+        topo.pack(fill="x", padx=16, pady=(0, 10))
+        self.bt_ident = self._botao(topo, "◉  Identificar fans (30 s)", self.identificar,
+                                    primario=True)
+        self.bt_ident.pack(side="left", fill="x", expand=True)
+
+        cg = self._cartao(p, "Seu gabinete, visto pelo vidro")
+        self.canvas_gab = CanvasGabinete(cg)
+        self.canvas_gab.pack(padx=20, pady=(6, 12))
+        self.canvas_gab.montar(None)
+
+        self.c_gab = self._cartao(p, "Onde fica cada um")
+        self.lista_gab = ctk.CTkFrame(self.c_gab, fg_color="transparent")
+        self.lista_gab.pack(fill="x", padx=12, pady=(6, 2))
+        ctk.CTkLabel(self.c_gab, text="Clique em “Identificar”: cada fan acende na cor ao lado do "
+                     "nome dela (e o desenho mostra a mesma cor). Escolha a posição de cada uma — "
+                     "o desenho e os LEDs mudam na hora. Fans que o hub não reconhece (ex.: a "
+                     "RX120 traseira) não aparecem e mantêm a luz padrão delas.",
+                     text_color=APAGADO, font=("Segoe UI", 10), wraplength=LARGURA - 40,
+                     justify="left").pack(anchor="w", padx=16, pady=(4, 10))
+
     def _mostrar_gabinete(self, gab):
         for w in self.lista_gab.winfo_children():
             w.destroy()
         if not gab:
-            self.c_gab.pack_forget()
+            ctk.CTkLabel(self.lista_gab, text="Nenhum hub iCUE LINK conectado.",
+                         text_color=SUAVE, font=("Segoe UI", 11)).pack(anchor="w", padx=4)
             return
         opcoes = list(gabinete.NOMES.values())
         nfan = 0
@@ -874,12 +943,15 @@ class App:
             self.trab.parar_identificar()
             return
         self._identificando = True
-        self.bt_ident.configure(text="Parar", fg_color=DESTAQUE, text_color="#1a0d05")
+        self.bt_ident.configure(text="■  Parar identificação")
+        self.canvas_gab.identificacao()
         self.trab.identificar(30)
 
     def _fim_identificar_ui(self):
         self._identificando = False
-        self.bt_ident.configure(text="Identificar (30 s)", fg_color="#2a272d", text_color=TEXTO)
+        self.bt_ident.configure(text="◉  Identificar fans (30 s)")
+        if self.cfg["modo"] == "fixo":
+            self.canvas_gab.tudo(self._hex_com_brilho(self.cfg["cor"]))
 
     def _alternar(self, chave, ligado):
         deslig = set(self.cfg["desligados"])
@@ -1020,6 +1092,8 @@ class App:
             self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
         elif modo == "fixo":
             self.previa.tudo(self._hex_com_brilho(self.cfg["cor"]))
+            if hasattr(self, "canvas_gab") and not getattr(self, "_identificando", False):
+                self.canvas_gab.tudo(self._hex_com_brilho(self.cfg["cor"]))
         else:
             self._atualizar_efeito_ui()
         if hasattr(self, "icon"):
@@ -1235,12 +1309,17 @@ class App:
             self._fim_identificar_ui()
         elif tipo == "layouts":
             self._mostrar_gabinete(dados.get("gabinete"))
+            self.canvas_gab.montar(dados.get("gabinete"))
+            if getattr(self, "_identificando", False):
+                self.canvas_gab.identificacao()
             self.previa.montar(dados)
             self._atualizar_modo()
             self._visivel(self.root.state() != "withdrawn")
         elif tipo == "preview":
             if self.cfg["modo"] in ("papel_parede", "efeito"):
                 self.previa.leds(dados)
+                if not getattr(self, "_identificando", False):
+                    self.canvas_gab.leds(dados)
         elif tipo == "efeito_msi":
             if self.cfg["modo"] == "efeito":
                 self.previa.zonas_msi(dados if dados.startswith("#") else "#6b5cff")

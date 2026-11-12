@@ -1,0 +1,11 @@
+# ambiente Python
+.venv/
+__pycache__/
+
+# estado local da máquina (não versionar)
+config.json
+msi_backup.json
+rgb.log
+instalacao.log
+diagnostico_rgb.txt
+diagnostico_rgb.json

@@ -28,6 +28,16 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
 > Se usar Wallpaper Engine, desligue o plugin de LED dele (Configurações → Plugins → LED)
 > para ele não disputar o iCUE com o RGB Sync.
 
+## Aba Perfis
+
+- **Perfil** = modo, cor, brilho, monitor e quais aparelhos ficam ligados. Vêm três prontos
+  (Jogo, Noite, Trabalho); o que você muda na aba Iluminação fica salvo no perfil ativo.
+- **Atalhos globais**: **Ctrl+Alt+1…9** trocam de perfil de qualquer lugar (inclusive em jogo).
+  Também dá pra trocar pelo seletor da aba Iluminação e pelo menu da bandeja.
+- **Por programa**: associe um `.exe` a um perfil; quando ele abre, o perfil liga sozinho, e
+  quando fecha volta o anterior (o vigia olha a lista de processos a cada 3 s).
+- Criar (copia o atual), renomear, excluir e reordenar (a ordem define o atalho).
+
 ## Aba Dispositivos
 
 - **Liga/desliga por aparelho**: o que estiver desligado sai da sincronização (na Corsair, o
@@ -79,6 +89,7 @@ No iCUE, o SDK precisa estar ativado.
 - `rgb_core.py` — backends Corsair, MSI e teclado HyperX
 - `hyperx.py` — protocolo e mapa de teclas (ANSI/ABNT2) do Alloy Origins Core (`python hyperx.py` testa)
 - `papel_parede.py` — captura do papel de parede e cor por LED
+- `perfis.py` — perfis, atalhos globais (RegisterHotKey) e vigia de programas
 - `busca.py` — procura equipamentos RGB USB (`python busca.py` testa)
 - `icone.py` — gera o ícone da fogueira (`assets/`); o da bandeja tem o núcleo na cor atual
 - `instalar.ps1` — gera o .exe e instala

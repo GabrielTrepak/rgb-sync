@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import colorchooser
+from tkinter import colorchooser, filedialog
 
 import customtkinter as ctk
 import pystray
@@ -25,11 +25,12 @@ from PIL import Image
 
 import busca
 import motor
+import perfis
 from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.2"
+VERSAO = "3.3"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -53,7 +54,7 @@ CINZA_OFF = "#2b282e"
 
 MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo"}
 MONITORES = {"Principal": "principal", "Secundário": "secundario", "Os dois": "ambos"}
-ABAS = ("Iluminação", "Dispositivos")
+ABAS = ("Iluminação", "Perfis", "Dispositivos")
 LARGURA = 452
 COR_SITUACAO = {"compativel": OK, "planejado": ALERTA, "nao": SUAVE}
 
@@ -182,6 +183,11 @@ class App:
         self.root = root
         self.cfg = ler_config()
         self.cfg.setdefault("desligados", [])
+        perfis.garantir_perfis(self.cfg)
+        perfis.carregar_perfil(self.cfg, self.cfg["perfil"])
+        salvar_config(self.cfg)
+        self.auto_perfil = None          # perfil ligado sozinho por causa de um jogo
+        self.perfil_antes_auto = None
         self.conexao = {}
         self.pronto = False
         self.cor_geral = self.cfg.get("cor_papel", self.cfg["cor"])
@@ -217,6 +223,12 @@ class App:
                                       desligados=self.cfg["desligados"])
         self.trab.start()
         self._atualizar_modo()
+        self.atalhos = perfis.Atalhos(lambda i: root.after(0, self._atalho, i))
+        self.atalhos.definir(len(self.cfg["perfis"]))
+        self.vigia = perfis.Vigia(lambda: self.cfg["perfis"],
+                                  lambda alvo: root.after(0, self._perfil_auto, alvo))
+        self.vigia.start()
+        self._mostrar_perfis()
         if iniciar_escondido:
             root.withdraw()
 
@@ -282,8 +294,10 @@ class App:
         self.seg_aba.pack(fill="x", padx=16, pady=(0, 10))
 
         self.pag_luz = ctk.CTkFrame(r, fg_color="transparent")
+        self.pag_perf = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_disp = ctk.CTkFrame(r, fg_color="transparent")
         self._montar_luz(self.pag_luz)
+        self._montar_perfis(self.pag_perf)
         self._montar_disp(self.pag_disp)
         self.pag_luz.pack(fill="x")
 
@@ -293,6 +307,14 @@ class App:
         self.rodape.pack(pady=(0, 12))
 
     def _montar_luz(self, p):
+        lp = ctk.CTkFrame(p, fg_color="transparent")
+        lp.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(lp, text="Perfil", text_color=SUAVE, font=("Segoe UI", 12)).pack(
+            side="left", padx=(2, 10))
+        self.seg_perfil = self._segmentado(lp, list(self.cfg["perfis"]),
+                                           lambda n: self.aplicar_perfil(n))
+        self.seg_perfil.set(self.cfg["perfil"])
+        self.seg_perfil.pack(side="left", fill="x", expand=True)
         self.seg_modo = self._segmentado(p, list(MODOS), self._mudar_modo, altura=38,
                                          fonte=("Segoe UI Semibold", 13), forte=True)
         self.seg_modo.set(_nome(MODOS, self.cfg["modo"]))
@@ -396,11 +418,230 @@ class App:
                       fg_color="transparent", hover_color="#26232a", text_color=SUAVE,
                       font=("Segoe UI", 11), command=self.restaurar).pack(side="right")
 
+    # ================================================================ perfis
+    def _salvar(self):
+        perfis.guardar_no_perfil(self.cfg)
+        salvar_config(self.cfg)
+
+    def _ordem_perfis(self):
+        return list(self.cfg["perfis"])
+
+    def aplicar_perfil(self, nome, motivo=None):
+        """Troca de perfil e atualiza tudo (janela, bandeja, aparelhos, cores).
+        motivo: None (clique na janela), "atalho" ou "programa"."""
+        if nome not in self.cfg["perfis"]:
+            return
+        if motivo != "programa":
+            self.auto_perfil = None              # escolha manual manda
+        self._salvar()                           # guarda o atual antes de trocar
+        perfis.carregar_perfil(self.cfg, nome)
+        self.seg_perfil.set(nome)
+        self.seg_modo.set(_nome(MODOS, self.cfg["modo"]))
+        self.seg_monitor.set(_nome(MONITORES, self.cfg["monitor"]))
+        self.sl_brilho.set(self.cfg["brilho"])
+        self.lbl_brilho.configure(text=f"{int(self.cfg['brilho'])}%")
+        self.amostra.configure(fg_color=self.cfg["cor"])
+        self.ent_hex.delete(0, "end")
+        self.ent_hex.insert(0, self.cfg["cor"].upper())
+        self._atualizar_modo()
+        if self.pronto:
+            self.trab.desligar_dispositivos(set(self.cfg["desligados"]))
+        self.enviar()
+        self.icon.update_menu()
+        self._mostrar_perfis()
+        log.info("perfil: %s (%s)", nome, motivo or "janela")
+        if motivo:
+            try:
+                extra = " (programa aberto)" if motivo == "programa" else ""
+                self.icon.notify(f"Perfil \u201c{nome}\u201d{extra}", "RGB Sync")
+            except Exception:
+                pass
+
+    def _atalho(self, i):
+        ordem = self._ordem_perfis()
+        if i < len(ordem):
+            self.aplicar_perfil(ordem[i], "atalho")
+
+    def _perfil_auto(self, alvo):
+        """O vigia avisou: um programa associado abriu (alvo) ou fechou (None)."""
+        if alvo:
+            if alvo != self.cfg["perfil"]:
+                if not self.auto_perfil:
+                    self.perfil_antes_auto = self.cfg["perfil"]
+                self.aplicar_perfil(alvo, "programa")
+            self.auto_perfil = alvo
+        elif self.auto_perfil:
+            volta = self.perfil_antes_auto
+            if self.cfg["perfil"] == self.auto_perfil and volta in self.cfg["perfis"]:
+                self.aplicar_perfil(volta, "programa")
+            self.auto_perfil = self.perfil_antes_auto = None
+
+    def _perfis_mudaram(self):
+        self.seg_perfil.configure(values=self._ordem_perfis())
+        self.seg_perfil.set(self.cfg["perfil"])
+        self.atalhos.definir(len(self.cfg["perfis"]))
+        self.icon.update_menu()
+        self._salvar()
+        self._mostrar_perfis()
+
+    def novo_perfil(self):
+        nome = ctk.CTkInputDialog(text="Nome do novo perfil (copia o atual):",
+                                  title="Novo perfil").get_input()
+        nome = (nome or "").strip()[:20]
+        if not nome or nome in self.cfg["perfis"]:
+            return
+        self._salvar()
+        atual = self.cfg["perfis"][self.cfg["perfil"]]
+        self.cfg["perfis"][nome] = dict(atual, desligados=list(atual["desligados"]),
+                                        programas=[])
+        self.cfg["perfil"] = nome
+        self._perfis_mudaram()
+
+    def renomear_perfil(self, nome):
+        novo = ctk.CTkInputDialog(text=f"Novo nome para \u201c{nome}\u201d:",
+                                  title="Renomear perfil").get_input()
+        novo = (novo or "").strip()[:20]
+        if not novo or novo in self.cfg["perfis"]:
+            return
+        self.cfg["perfis"] = {(novo if k == nome else k): v
+                              for k, v in self.cfg["perfis"].items()}
+        if self.cfg["perfil"] == nome:
+            self.cfg["perfil"] = novo
+        self._perfis_mudaram()
+
+    def excluir_perfil(self, nome):
+        if len(self.cfg["perfis"]) <= 1:
+            return
+        del self.cfg["perfis"][nome]
+        if self.cfg["perfil"] == nome:
+            # o perfil ativo sumiu: carrega outro (sem salvar o apagado em cima dele)
+            self.aplicar_perfil(next(iter(self.cfg["perfis"])))
+        self._perfis_mudaram()
+
+    def mover_perfil(self, nome, delta):
+        ordem = self._ordem_perfis()
+        i = ordem.index(nome)
+        j = max(0, min(len(ordem) - 1, i + delta))
+        ordem.insert(j, ordem.pop(i))
+        self.cfg["perfis"] = {k: self.cfg["perfis"][k] for k in ordem}
+        self._perfis_mudaram()
+
+    def adicionar_programa(self, nome):
+        caminho = filedialog.askopenfilename(
+            title=f"Programa que ativa o perfil {nome}",
+            filetypes=[("Programas", "*.exe"), ("Todos os arquivos", "*.*")])
+        if caminho:
+            exe = os.path.basename(caminho)
+            progs = self.cfg["perfis"][nome].setdefault("programas", [])
+            if exe.lower() not in (x.lower() for x in progs):
+                progs.append(exe)
+            self._perfis_mudaram()
+
+    def remover_programa(self, nome, exe):
+        progs = self.cfg["perfis"][nome].get("programas", [])
+        if exe in progs:
+            progs.remove(exe)
+        self._perfis_mudaram()
+
+    def _montar_perfis(self, p):
+        topo = ctk.CTkFrame(p, fg_color="transparent")
+        topo.pack(fill="x", padx=16, pady=(0, 10))
+        self._botao(topo, "+  Novo perfil (copia o atual)", self.novo_perfil,
+                    primario=True).pack(side="left", fill="x", expand=True)
+        self.lista_perfis = ctk.CTkFrame(p, fg_color="transparent")
+        self.lista_perfis.pack(fill="x")
+        dica = self._cartao(p)
+        ctk.CTkLabel(dica, text="O que você muda na aba Iluminação fica salvo no perfil ativo.\n"
+                     "Os atalhos funcionam em qualquer lugar, inclusive dentro de jogos.\n"
+                     "Com um programa associado aberto, o perfil liga sozinho;\n"
+                     "ao fechar o programa, volta o perfil anterior.",
+                     text_color=SUAVE, font=("Segoe UI", 10), justify="left").pack(
+            anchor="w", padx=16, pady=10)
+
+    def _resumo_perfil(self, p):
+        if p["modo"] == "papel_parede":
+            txt = f"Papel de parede ({_nome(MONITORES, p.get('monitor', 'principal')).lower()})"
+        else:
+            txt = "Cor fixa" if p["cor"] != "#000000" else "Apagado"
+        txt += f" · {int(p['brilho'])}%"
+        if p.get("desligados"):
+            txt += f" · {len(p['desligados'])} desligado(s)"
+        return txt
+
+    def _mostrar_perfis(self):
+        if not hasattr(self, "lista_perfis"):
+            return
+        for w in self.lista_perfis.winfo_children():
+            w.destroy()
+        ordem = self._ordem_perfis()
+        for i, nome in enumerate(ordem):
+            p = self.cfg["perfis"][nome]
+            ativo = nome == self.cfg["perfil"]
+            c = ctk.CTkFrame(self.lista_perfis, fg_color=CARTAO, corner_radius=14,
+                             border_width=2 if ativo else 1,
+                             border_color=DESTAQUE if ativo else BORDA)
+            c.pack(fill="x", padx=16, pady=(0, 8))
+            l1 = ctk.CTkFrame(c, fg_color="transparent")
+            l1.pack(fill="x", padx=12, pady=(10, 0))
+            ctk.CTkFrame(l1, width=18, height=18, corner_radius=9,
+                         fg_color=p["cor"] if p["modo"] == "fixo" else DESTAQUE).pack(
+                side="left", padx=(2, 8))
+            ctk.CTkLabel(l1, text=nome, text_color=TEXTO,
+                         font=("Segoe UI Semibold", 13)).pack(side="left")
+            if i < 9:
+                ctk.CTkLabel(l1, text=f" {perfis.texto_atalho(i)} ", fg_color="#2a272d",
+                             corner_radius=6, text_color=SUAVE, font=("Consolas", 10),
+                             height=18).pack(side="left", padx=8)
+            if ativo:
+                ctk.CTkLabel(l1, text="ATIVO", text_color=DESTAQUE,
+                             font=("Segoe UI Semibold", 10)).pack(side="left")
+            else:
+                ctk.CTkButton(l1, text="Ativar", width=60, height=24, fg_color=DESTAQUE,
+                              hover_color=DESTAQUE_HOVER, text_color="#1a0d05",
+                              font=("Segoe UI Semibold", 11),
+                              command=lambda n=nome: self.aplicar_perfil(n)).pack(side="right")
+            ctk.CTkLabel(c, text=self._resumo_perfil(p), text_color=SUAVE,
+                         font=("Segoe UI", 10), anchor="w").pack(anchor="w", padx=40)
+            lp = ctk.CTkFrame(c, fg_color="transparent")
+            lp.pack(fill="x", padx=36, pady=(4, 0))
+            for exe in p.get("programas", []):
+                ctk.CTkButton(lp, text=f"{exe}  \u2715", height=22, width=10,
+                              fg_color="#2a272d", hover_color="#4a2a26", text_color=TEXTO,
+                              font=("Segoe UI", 10),
+                              command=lambda n=nome, e=exe: self.remover_programa(n, e)).pack(
+                    side="left", padx=(0, 4), pady=2)
+            ctk.CTkButton(lp, text="+ programa que ativa", height=22, width=10,
+                          fg_color="transparent", border_width=1, border_color=BORDA,
+                          hover_color="#26232a", text_color=SUAVE, font=("Segoe UI", 10),
+                          command=lambda n=nome: self.adicionar_programa(n)).pack(
+                side="left", pady=2)
+            la = ctk.CTkFrame(c, fg_color="transparent")
+            la.pack(fill="x", padx=32, pady=(2, 8))
+
+            def peq(texto, cmd, cor=SUAVE, pai=la):
+                return ctk.CTkButton(pai, text=texto, width=10, height=22,
+                                     fg_color="transparent", hover_color="#26232a",
+                                     text_color=cor, font=("Segoe UI", 10), command=cmd)
+            peq("Renomear", lambda n=nome: self.renomear_perfil(n)).pack(side="left")
+            if len(ordem) > 1:
+                peq("Excluir", lambda n=nome: self.excluir_perfil(n), "#d0625a").pack(
+                    side="left")
+            if i > 0:
+                peq("\u2191", lambda n=nome: self.mover_perfil(n, -1)).pack(side="right")
+            if i < len(ordem) - 1:
+                peq("\u2193", lambda n=nome: self.mover_perfil(n, 1)).pack(side="right")
+        falharam = getattr(getattr(self, "atalhos", None), "falharam", [])
+        if falharam:
+            ctk.CTkLabel(self.lista_perfis, text="\u26a0 Atalhos já usados por outro programa: "
+                         + ", ".join(falharam), text_color=ALERTA,
+                         font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(0, 6))
+
     # ================================================================ abas
     def _mudar_aba(self, nome):
-        self.pag_luz.pack_forget()
-        self.pag_disp.pack_forget()
-        (self.pag_luz if nome == ABAS[0] else self.pag_disp).pack(fill="x", before=self.rodape)
+        paginas = dict(zip(ABAS, (self.pag_luz, self.pag_perf, self.pag_disp)))
+        for pg in paginas.values():
+            pg.pack_forget()
+        paginas.get(nome, self.pag_luz).pack(fill="x", before=self.rodape)
         self.seg_aba.set(nome)
 
     # ================================================================ lista de dispositivos
@@ -467,7 +708,7 @@ class App:
         deslig = set(self.cfg["desligados"])
         (deslig.discard if ligado else deslig.add)(chave)
         self.cfg["desligados"] = sorted(deslig)
-        salvar_config(self.cfg)
+        self._salvar()
         self.trab.desligar_dispositivos(deslig)
 
     def _mostrar_outros(self, lista):
@@ -509,7 +750,7 @@ class App:
 
         def guardar():
             self.cfg["usb_conhecidos"] = sorted(conhecidos | {d["chave"] for d in lista})
-            salvar_config(self.cfg)
+            self._salvar()
         # guarda depois de mostrar (pra o selo NOVO aparecer nesta busca)
         self.root.after(200, guardar)
         self.root.after(0, lambda: self.bt_busca.configure(state="normal",
@@ -570,6 +811,10 @@ class App:
                              checked=lambda i: self.cfg["modo"] == "papel_parede", radio=True),
             pystray.MenuItem("Cor fixa", ui(self._mudar_modo, "Cor fixa"),
                              checked=lambda i: self.cfg["modo"] == "fixo", radio=True),
+            pystray.MenuItem("Perfis", pystray.Menu(lambda: tuple(
+                pystray.MenuItem(n, ui(self.aplicar_perfil, n, "atalho"),
+                                 checked=lambda i, n=n: self.cfg["perfil"] == n, radio=True)
+                for n in self._ordem_perfis()))),
             pystray.MenuItem("Cores", cores),
             pystray.MenuItem("Apagar tudo", ui(self.definir, "#000000")),
             pystray.Menu.SEPARATOR,
@@ -639,7 +884,7 @@ class App:
             self.definir(hexa)
 
     def enviar(self):
-        salvar_config(self.cfg)
+        self._salvar()
         if not self.pronto:
             return
         if self.cfg["modo"] == "papel_parede":
@@ -695,6 +940,11 @@ class App:
                 pass
 
     def sair(self):
+        try:
+            self.atalhos.parar()
+            self.vigia.parar()
+        except Exception:
+            pass
         self.trab.fila.put(("sair", None))
         self.trab.join(timeout=5)
         self.icon.stop()
@@ -727,7 +977,7 @@ class App:
             geral, fonte = dados
             self.cor_geral = rgb_hex(geral)
             self.cfg["cor_papel"] = self.cor_geral
-            salvar_config(self.cfg)
+            self._salvar()
             if self.cfg["modo"] == "papel_parede":
                 self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
                 self.lbl_fonte.configure(text=f"Ao vivo  ·  {fonte}")

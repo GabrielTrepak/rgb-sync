@@ -27,13 +27,14 @@ from PIL import Image
 import busca
 import efeitos
 import gabinete
+import luzes
 import motor
 import perfis
 from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.7"
+VERSAO = "3.8"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -57,7 +58,7 @@ CINZA_OFF = "#2b282e"
 
 MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo", "Efeito": "efeito"}
 MONITORES = {"Principal": "principal", "Secundário": "secundario", "Os dois": "ambos"}
-ABAS = ("Iluminação", "Gabinete", "Perfis", "Dispositivos")
+ABAS = ("Iluminação", "Gabinete", "Luzes", "Perfis", "Dispositivos")
 LARGURA = 452
 COR_SITUACAO = {"compativel": OK, "planejado": ALERTA, "nao": SUAVE}
 
@@ -406,6 +407,7 @@ class App:
         self.vigia = perfis.Vigia(lambda: self.cfg["perfis"],
                                   lambda alvo: root.after(0, self._perfil_auto, alvo))
         self.vigia.start()
+        self._iniciar_luzes()
         self._mostrar_perfis()
         if iniciar_escondido:
             root.withdraw()
@@ -473,10 +475,12 @@ class App:
 
         self.pag_luz = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_gab = ctk.CTkFrame(r, fg_color="transparent")
+        self.pag_luzes = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_perf = ctk.CTkFrame(r, fg_color="transparent")
         self.pag_disp = ctk.CTkFrame(r, fg_color="transparent")
         self._montar_luz(self.pag_luz)
         self._montar_aba_gabinete(self.pag_gab)
+        self._montar_aba_luzes(self.pag_luzes)
         self._montar_perfis(self.pag_perf)
         self._montar_disp(self.pag_disp)
         self.pag_luz.pack(fill="x")
@@ -866,11 +870,13 @@ class App:
 
     # ================================================================ abas
     def _mudar_aba(self, nome):
-        paginas = dict(zip(ABAS, (self.pag_luz, self.pag_gab, self.pag_perf, self.pag_disp)))
+        paginas = dict(zip(ABAS, (self.pag_luz, self.pag_gab, self.pag_luzes, self.pag_perf,
+                                  self.pag_disp)))
         for pg in paginas.values():
             pg.pack_forget()
         paginas.get(nome, self.pag_luz).pack(fill="x", before=self.rodape)
         self.seg_aba.set(nome)
+        self._vigiar_luzes()
 
     # ================================================================ lista de dispositivos
     def _linha(self, pai, titulo, sub, cor_sub=SUAVE, direita=None, selo=None):
@@ -931,6 +937,309 @@ class App:
                         self.icon.notify(d["aviso"], "RGB Sync — teclado")
                     except Exception:
                         pass
+
+    # ---- luzes da casa (Tuya)
+    PRESETS_LUZ = [("#ff0000"), ("#ff5a00"), ("#ffc800"), ("#00ff40"), ("#00e5ff"),
+                   ("#0050ff"), ("#8000ff"), ("#ff00a0")]
+
+    def _iniciar_luzes(self):
+        self.luzes = {}
+        self.cfg.setdefault("luzes", {})
+        try:
+            luzes.importar_automatico()
+        except Exception:
+            log.exception("importar luzes")
+        for info in luzes.ler():
+            self._nova_luz(info)
+        self._mostrar_luzes()
+        self._sync_t = 0.0
+        self.root.after(500, self._tique_sync)
+
+    def _nova_luz(self, info):
+        luz = luzes.Luz(info, lambda i, e: self.root.after(0, self._estado_luz, i, e),
+                        lambda i, ip: self.root.after(0, self._ip_luz, i, ip))
+        self.luzes[info["id"]] = luz
+        self.cfg["luzes"].setdefault(info["id"], {"sync": False, "brilho_sync": 60})
+        luz.start()
+        luz.ler_agora()
+        # se o app fechou com a sincronização ligada, devolve a luz como estava
+        foto = self.cfg["luzes"][info["id"]].get("foto")
+        if foto and not self.cfg["luzes"][info["id"]].get("sync"):
+            luz.restaurar(foto)
+            self.cfg["luzes"][info["id"]].pop("foto", None)
+
+    def _ip_luz(self, id_, ip):
+        lista = luzes.ler()
+        for l in lista:
+            if l["id"] == id_:
+                l["ip"] = ip
+        luzes.salvar(lista)
+
+    def _vigiar_luzes(self):
+        ver = self.seg_aba.get() == "Luzes" and self.root.state() != "withdrawn"
+        for luz in getattr(self, "luzes", {}).values():
+            luz.vigiar = ver
+            if ver:
+                luz.ler_agora()
+
+    def _montar_aba_luzes(self, p):
+        self.lista_luzes = ctk.CTkFrame(p, fg_color="transparent")
+        self.lista_luzes.pack(fill="x")
+        self.widgets_luz = {}
+        rod = ctk.CTkFrame(p, fg_color="transparent")
+        rod.pack(fill="x", padx=16, pady=(0, 10))
+        self._botao(rod, "Importar luzes (devices.json)…", self.importar_luzes).pack(
+            side="left")
+        ctk.CTkLabel(rod, text="Tuya · Smart Life · Ekaza — direto pela rede de casa",
+                     text_color=APAGADO, font=("Segoe UI", 10)).pack(side="right")
+
+    def importar_luzes(self):
+        caminho = filedialog.askopenfilename(
+            title="devices.json do tinytuya wizard", filetypes=[("devices.json", "*.json")])
+        if not caminho:
+            return
+        try:
+            luzes.importar(caminho)
+        except Exception:
+            log.exception("importar luzes")
+            return
+        for info in luzes.ler():
+            if info["id"] not in self.luzes:
+                self._nova_luz(info)
+        self._mostrar_luzes()
+
+    def _mostrar_luzes(self):
+        for w in self.lista_luzes.winfo_children():
+            w.destroy()
+        self.widgets_luz = {}
+        if not self.luzes:
+            c = self._cartao(self.lista_luzes, "Nenhuma luz configurada")
+            ctk.CTkLabel(c, text="Rode o assistente (tinytuya wizard) e importe o devices.json "
+                         "com o botão abaixo.", text_color=SUAVE, font=("Segoe UI", 11),
+                         wraplength=LARGURA - 40, justify="left").pack(anchor="w", padx=16,
+                                                                       pady=(4, 12))
+            return
+        for id_, luz in self.luzes.items():
+            self._cartao_luz(id_, luz)
+
+    def _cartao_luz(self, id_, luz):
+        info, conf = luz.info, self.cfg["luzes"][id_]
+        c = self._cartao(self.lista_luzes)
+        w = {"cartao": c}
+        l1 = ctk.CTkFrame(c, fg_color="transparent")
+        l1.pack(fill="x", padx=16, pady=(12, 2))
+        ctk.CTkLabel(l1, text="💡  " + info["nome"], text_color=TEXTO,
+                     font=("Segoe UI Semibold", 15)).pack(side="left")
+        w["var_on"] = ctk.BooleanVar(value=False)
+        w["sw_on"] = ctk.CTkSwitch(l1, text="", width=50, variable=w["var_on"],
+                                   progress_color=DESTAQUE,
+                                   command=lambda: self._luz_ligar(id_))
+        w["sw_on"].pack(side="right")
+        w["estado"] = ctk.CTkLabel(c, text="conectando…", text_color=APAGADO,
+                                   font=("Segoe UI", 10))
+        w["estado"].pack(anchor="w", padx=40)
+
+        w["seg"] = self._segmentado(c, ["Branca", "Colorida"], lambda v: self._luz_modo(id_, v))
+        w["seg"].pack(fill="x", padx=16, pady=(8, 6))
+        # --- branca
+        fb = ctk.CTkFrame(c, fg_color="transparent")
+        w["f_branca"] = fb
+
+        def linha_slider(pai, rotulo, cmd, esq=None, dir_=None, cor=DESTAQUE):
+            f = ctk.CTkFrame(pai, fg_color="transparent")
+            f.pack(fill="x", padx=16, pady=3)
+            ctk.CTkLabel(f, text=rotulo, width=84, anchor="w", text_color=TEXTO,
+                         font=("Segoe UI", 12)).pack(side="left")
+            if dir_:
+                ctk.CTkLabel(f, text=dir_, text_color=SUAVE, font=("Segoe UI", 10)).pack(
+                    side="right")
+            sl = ctk.CTkSlider(f, from_=0, to=100, number_of_steps=100, button_color=cor,
+                               button_hover_color=DESTAQUE_HOVER, progress_color=cor,
+                               fg_color="#2a272d", command=lambda v: cmd())
+            sl.pack(side="right", fill="x", expand=True, padx=6)
+            if esq:
+                ctk.CTkLabel(f, text=esq, text_color=SUAVE, font=("Segoe UI", 10)).pack(
+                    side="right")
+            return sl
+        w["sl_brilho_b"] = linha_slider(fb, "Brilho", lambda: self._luz_branca(id_))
+        w["sl_temp"] = linha_slider(fb, "Temperatura", lambda: self._luz_branca(id_),
+                                    "quente", "fria", "#cdd6ff")
+        # --- colorida
+        fc = ctk.CTkFrame(c, fg_color="transparent")
+        w["f_cor"] = fc
+        pr = ctk.CTkFrame(fc, fg_color="transparent")
+        pr.pack(fill="x", padx=16, pady=(2, 4))
+        for cor in self.PRESETS_LUZ:
+            ctk.CTkButton(pr, text="", width=30, height=30, corner_radius=15, fg_color=cor,
+                          hover_color=cor, border_width=2, border_color=CARTAO,
+                          command=lambda c_=cor: self._luz_cor(id_, c_)).pack(side="left", padx=2)
+        w["amostra"] = ctk.CTkFrame(pr, width=30, height=30, corner_radius=8, fg_color="#333")
+        self._botao(pr, "Outra…", lambda: self._luz_escolher(id_), width=64).pack(side="right")
+        w["amostra"].pack(side="right", padx=6)
+        w["sl_brilho_c"] = linha_slider(fc, "Brilho", lambda: self._luz_cor(id_, None))
+        w["cor"] = "#ff5a00"
+        # --- sincronizar (opcional)
+        fs = ctk.CTkFrame(c, fg_color="transparent")
+        fs.pack(fill="x", padx=16, pady=(8, 2), side="bottom")
+        w["var_sync"] = ctk.BooleanVar(value=conf.get("sync", False))
+        ctk.CTkSwitch(fs, text="Sincronizar com o PC", variable=w["var_sync"],
+                      progress_color=DESTAQUE, text_color=TEXTO, font=("Segoe UI", 12),
+                      command=lambda: self._luz_sync(id_)).pack(side="left")
+        w["sl_sync"] = ctk.CTkSlider(fs, from_=5, to=100, width=110, button_color=DESTAQUE,
+                                     progress_color=DESTAQUE, fg_color="#2a272d",
+                                     command=lambda v: self._luz_brilho_sync(id_, v))
+        w["sl_sync"].set(conf.get("brilho_sync", 60))
+        w["lbl_sync"] = ctk.CTkLabel(fs, text=f"{int(conf.get('brilho_sync', 60))}%", width=34,
+                                     text_color=SUAVE, font=("Segoe UI", 10))
+        w["lbl_sync"].pack(side="right")
+        w["sl_sync"].pack(side="right", padx=4)
+        ctk.CTkLabel(c, text=f"{info.get('produto', '')} · IP {info.get('ip') or '?'} · "
+                     f"protocolo {info.get('versao')}", text_color=APAGADO,
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 10), side="bottom")
+        self.widgets_luz[id_] = w
+        self._luz_modo_ui(id_, "white")
+        self._luz_sync_ui(id_)
+        if luz.online is not None:
+            self._estado_luz(id_, luzes.ler_estado(luz.dps, info.get("v2", True))
+                             if luz.online else None)
+
+    # ---- atualização vinda da luz (estado real, inclusive mudanças pelo celular)
+    def _estado_luz(self, id_, est):
+        w = self.widgets_luz.get(id_)
+        if not w:
+            return
+        self._sem_eco = True
+        try:
+            if est is None:
+                w["estado"].configure(text="●  sem conexão (tentando de novo…)",
+                                      text_color=ALERTA)
+                return
+            sync = self.cfg["luzes"][id_].get("sync")
+            w["estado"].configure(text="●  sincronizando com o PC" if sync else
+                                  ("●  ligada" if est["ligada"] else "●  desligada"),
+                                  text_color=OK if est["ligada"] else SUAVE)
+            w["var_on"].set(est["ligada"])
+            if sync:
+                return
+            modo = "colour" if est["modo"] == "colour" else "white"
+            self._luz_modo_ui(id_, modo)
+            if modo == "white":
+                w["sl_brilho_b"].set(est["brilho"])
+                w["sl_temp"].set(est["temp"])
+            else:
+                w["sl_brilho_c"].set(est["brilho"])
+                if est["rgb"]:
+                    w["cor"] = rgb_hex(est["rgb"])
+                    w["amostra"].configure(fg_color=w["cor"])
+        finally:
+            self._sem_eco = False
+
+    def _luz_modo_ui(self, id_, modo):
+        w = self.widgets_luz[id_]
+        w["seg"].set("Colorida" if modo == "colour" else "Branca")
+        w["f_branca"].pack_forget()
+        w["f_cor"].pack_forget()
+        (w["f_cor"] if modo == "colour" else w["f_branca"]).pack(fill="x", after=w["seg"])
+
+    def _luz_sync_ui(self, id_):
+        w = self.widgets_luz[id_]
+        sync = self.cfg["luzes"][id_].get("sync")
+        estado = "disabled" if sync else "normal"
+        for k in ("seg", "sl_brilho_b", "sl_temp", "sl_brilho_c"):
+            w[k].configure(state=estado)
+        w["sl_sync"].configure(state="normal" if sync else "disabled")
+
+    # ---- comandos manuais
+    def _luz_ligar(self, id_):
+        if getattr(self, "_sem_eco", False):
+            return
+        self.luzes[id_].ligar(self.widgets_luz[id_]["var_on"].get())
+
+    def _luz_modo(self, id_, nome):
+        self._luz_modo_ui(id_, "colour" if nome == "Colorida" else "white")
+        if nome == "Colorida":
+            self._luz_cor(id_, None)
+        else:
+            self._luz_branca(id_)
+
+    def _luz_branca(self, id_):
+        if getattr(self, "_sem_eco", False) or self.cfg["luzes"][id_].get("sync"):
+            return
+        w = self.widgets_luz[id_]
+        w["var_on"].set(True)
+        self.luzes[id_].branca(w["sl_brilho_b"].get(), w["sl_temp"].get())
+
+    def _luz_cor(self, id_, hexa):
+        if getattr(self, "_sem_eco", False) or self.cfg["luzes"][id_].get("sync"):
+            return
+        w = self.widgets_luz[id_]
+        if hexa:
+            w["cor"] = hexa
+            w["amostra"].configure(fg_color=hexa)
+            if w["seg"].get() != "Colorida":
+                self._luz_modo_ui(id_, "colour")
+        w["var_on"].set(True)
+        self.luzes[id_].cor(hex_rgb(w["cor"]), max(5, w["sl_brilho_c"].get()))
+
+    def _luz_escolher(self, id_):
+        _, hexa = colorchooser.askcolor(color=self.widgets_luz[id_]["cor"], title="Cor da luz")
+        if hexa:
+            self._luz_cor(id_, hexa)
+
+    # ---- sincronizar com o PC (opcional)
+    def _luz_sync(self, id_):
+        conf, luz = self.cfg["luzes"][id_], self.luzes[id_]
+        ligar = self.widgets_luz[id_]["var_sync"].get()
+        conf["sync"] = ligar
+        if ligar:
+            conf["foto"] = luz.foto()           # pra voltar como estava depois
+            self._sync_ultima = {}
+            self._sync_luzes(forcar=True)
+        else:
+            luz.restaurar(conf.pop("foto", None))
+            luz.ler_agora()
+        self._salvar()
+        self._luz_sync_ui(id_)
+
+    def _luz_brilho_sync(self, id_, v):
+        self.cfg["luzes"][id_]["brilho_sync"] = int(v)
+        self.widgets_luz[id_]["lbl_sync"].configure(text=f"{int(v)}%")
+        self._sync_luzes(forcar=True)
+
+    def _cor_pc(self):
+        """A cor 'geral' que o PC está mostrando agora (pra luz do teto)."""
+        modo = self.cfg["modo"]
+        if modo == "papel_parede":
+            return self.cor_geral
+        if modo == "fixo":
+            return self.cfg["cor"]
+        t = time.monotonic()
+        tipo = self.cfg["efeito"]
+        if tipo == "temperatura":
+            return getattr(self, "_cor_temp", "#3c8cff")
+        cor = efeitos.cor_led(tipo, t, 0.5, hex_rgb(self.cfg["cor"]), self.cfg["velocidade"])
+        return rgb_hex(round(min(255, c)) for c in cor)
+
+    def _sync_luzes(self, forcar=False):
+        if not getattr(self, "luzes", None):
+            return
+        cor = self._cor_pc()
+        for id_, luz in self.luzes.items():
+            conf = self.cfg["luzes"].get(id_, {})
+            if not conf.get("sync"):
+                continue
+            chave = (cor, conf.get("brilho_sync"))
+            if forcar or getattr(self, "_sync_ultima", {}).get(id_) != chave:
+                self._sync_ultima = dict(getattr(self, "_sync_ultima", {}), **{id_: chave})
+                luz.cor(hex_rgb(cor), conf.get("brilho_sync", 60))
+
+    def _tique_sync(self):
+        """Efeitos animados mudam a cor o tempo todo: manda pra luz ~3x por segundo."""
+        try:
+            if self.cfg["modo"] == "efeito" and self.cfg["efeito"] != "temperatura":
+                self._sync_luzes()
+        finally:
+            self.root.after(350, self._tique_sync)
 
     # ---- gabinete
     NOMES_TIPO = {9: "Cooler (bomba)", 12: "Fan QX"}
@@ -1293,6 +1602,7 @@ class App:
         else:
             self.trab.cor_fixa(hex_rgb(self._hex_com_brilho(self.cfg["cor"])))
             self.previa.tudo(self._hex_com_brilho(self.cfg["cor"]))
+        self._sync_luzes()
 
     def _mudar_inicio(self):
         querer = self.var_inicio.get()
@@ -1315,6 +1625,8 @@ class App:
             self.root.after(150, aplicar)
         if hasattr(self, "trab"):
             self.trab.ligar_preview(sim and self.root.state() != "withdrawn")
+        if hasattr(self, "seg_aba"):
+            self._vigiar_luzes()
 
     def mostrar(self, aba=None):
         if aba in ABAS:
@@ -1341,6 +1653,18 @@ class App:
             self.vigia.parar()
         except Exception:
             pass
+        try:
+            for id_, luz in getattr(self, "luzes", {}).items():
+                conf = self.cfg["luzes"].get(id_, {})
+                if conf.get("sync") and conf.get("foto"):
+                    luz.restaurar(conf["foto"])
+            fim = time.monotonic() + 2
+            while time.monotonic() < fim and any(l._pendente for l in self.luzes.values()):
+                time.sleep(0.1)
+            for luz in self.luzes.values():
+                luz.parar()
+        except Exception:
+            log.exception("luzes ao sair")
         self.trab.fila.put(("sair", None))
         self.trab.join(timeout=5)
         self.icon.stop()
@@ -1378,6 +1702,9 @@ class App:
                 if not getattr(self, "_identificando", False):
                     self.canvas_gab.leds(dados)
         elif tipo == "efeito_msi":
+            if self.cfg["modo"] == "efeito" and self.cfg["efeito"] == "temperatura":
+                self._cor_temp = dados
+                self._sync_luzes()
             if self.cfg["modo"] == "efeito":
                 self.previa.zonas_msi(dados if dados.startswith("#") else "#6b5cff")
         elif tipo == "sensor":
@@ -1388,6 +1715,7 @@ class App:
             self.cfg["cor_papel"] = self.cor_geral
             self._salvar()
             if self.cfg["modo"] == "papel_parede":
+                self._sync_luzes()
                 self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
                 self.lbl_fonte.configure(text=f"Ao vivo  ·  {fonte}")
                 self.icon.icon = self._img_bandeja()

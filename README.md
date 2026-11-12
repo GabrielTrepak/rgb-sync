@@ -47,6 +47,19 @@ cima/baixo, traseira, cooler). A partir daÃ­ cada LED do anel da fan pega o pa
 passa pelas fans na ordem fÃ­sica, e a prÃ©via desenha o gabinete. Fans que o hub nÃ£o
 reconhece (ex.: RX120 com o firmware atual do hub) ficam de fora.
 
+## Aba Luzes (luzes da casa: Tuya / Smart Life / Ekaza)
+
+Controle direto pela rede local (sem nuvem): ligar/desligar, **branca** (brilho e temperatura
+quente↔fria) ou **colorida** (cores, seletor, brilho). O estado real é lido a cada 15 s com a
+aba aberta (mudanças feitas pelo celular aparecem). Opcional: **Sincronizar com o PC** — a luz
+segue a cor geral do PC com brilho próprio, e ao desligar (ou ao sair do app) volta como estava.
+
+Configuração (uma vez): conta gratuita em platform.tuya.com → projeto de nuvem (Smart Home,
+Western America) → vincular o app **Smart Life** (QR) → `python -m tinytuya wizard` na pasta do
+projeto. O app importa as luzes do `devices.json` para `%APPDATA%\RGB Sync\luzes.json`.
+Os arquivos com chaves (`devices.json`, `tinytuya.json`, `snapshot.json`, `tuya-raw.json`)
+ficam fora do Git.
+
 ## Controle externo (Stream Deck, scripts)
 
 ```powershell

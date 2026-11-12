@@ -23,7 +23,7 @@ if (-not $SemBuild) {
         --icon (Join-Path $raiz 'assets\rgbsync.ico') `
         --add-data "$(Join-Path $raiz 'assets');assets" `
         --collect-all customtkinter --collect-all cuesdk `
-        --hidden-import pystray._win32 --hidden-import hid --hidden-import hyperx `
+        --hidden-import pystray._win32 --hidden-import hid --hidden-import hyperx --collect-submodules tinytuya `
         --distpath (Join-Path $raiz 'dist') --workpath (Join-Path $raiz 'build') `
         --specpath (Join-Path $raiz 'build') `
         (Join-Path $raiz 'app.py')

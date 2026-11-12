@@ -394,8 +394,11 @@ class App:
                                   lambda: root.after(0, self.sair),
                                   lambda cmd: root.after(0, self.comando, cmd))
         root.protocol("WM_DELETE_WINDOW", self.esconder)
-        root.bind("<Map>", lambda e: self._visivel(True))
-        root.bind("<Unmap>", lambda e: self._visivel(False))
+        # Só a janela principal conta: <Map>/<Unmap> também chegam de cada widget que
+        # aparece/some dentro dela (trocar de aba, reorganizar um cartão) — reagir a esses
+        # criava um loop que travava a interface.
+        root.bind("<Map>", lambda e: e.widget is root and self._visivel(True))
+        root.bind("<Unmap>", lambda e: e.widget is root and self._visivel(False))
 
         self.trab = motor.Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d),
                                       desligados=self.cfg["desligados"])
@@ -1118,8 +1121,10 @@ class App:
             w["estado"].configure(text="●  sincronizando com o PC" if sync else
                                   ("●  ligada" if est["ligada"] else "●  desligada"),
                                   text_color=OK if est["ligada"] else SUAVE)
-            w["var_on"].set(est["ligada"])
-            if sync:
+            mexendo = time.monotonic() - w.get("mexeu", 0) < 3
+            if not mexendo:
+                w["var_on"].set(est["ligada"])
+            if sync or mexendo:
                 return
             modo = "colour" if est["modo"] == "colour" else "white"
             self._luz_modo_ui(id_, modo)
@@ -1136,6 +1141,9 @@ class App:
 
     def _luz_modo_ui(self, id_, modo):
         w = self.widgets_luz[id_]
+        if w.get("modo") == modo:
+            return
+        w["modo"] = modo
         w["seg"].set("Colorida" if modo == "colour" else "Branca")
         w["f_branca"].pack_forget()
         w["f_cor"].pack_forget()
@@ -1153,9 +1161,11 @@ class App:
     def _luz_ligar(self, id_):
         if getattr(self, "_sem_eco", False):
             return
+        self.widgets_luz[id_]["mexeu"] = time.monotonic()
         self.luzes[id_].ligar(self.widgets_luz[id_]["var_on"].get())
 
     def _luz_modo(self, id_, nome):
+        self.widgets_luz[id_]["mexeu"] = time.monotonic()
         self._luz_modo_ui(id_, "colour" if nome == "Colorida" else "white")
         if nome == "Colorida":
             self._luz_cor(id_, None)
@@ -1166,6 +1176,7 @@ class App:
         if getattr(self, "_sem_eco", False) or self.cfg["luzes"][id_].get("sync"):
             return
         w = self.widgets_luz[id_]
+        w["mexeu"] = time.monotonic()
         w["var_on"].set(True)
         self.luzes[id_].branca(w["sl_brilho_b"].get(), w["sl_temp"].get())
 
@@ -1178,6 +1189,7 @@ class App:
             w["amostra"].configure(fg_color=hexa)
             if w["seg"].get() != "Colorida":
                 self._luz_modo_ui(id_, "colour")
+        w["mexeu"] = time.monotonic()
         w["var_on"].set(True)
         self.luzes[id_].cor(hex_rgb(w["cor"]), max(5, w["sl_brilho_c"].get()))
 

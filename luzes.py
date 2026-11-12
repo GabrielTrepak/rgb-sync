@@ -209,10 +209,12 @@ class Luz(threading.Thread):
             log.exception("redescobrir luz")
         return False
 
-    def _marcar(self, online, dps=None):
+    def _marcar(self, online, dps=None, avisar=True):
+        """avisar=False: comando que NÓS mandamos — só guarda o estado, sem pedir pra
+        interface se redesenhar (ela já mostra o que o usuário escolheu)."""
         if dps:
             self.dps.update({str(k): v for k, v in dps.items()})
-        if online != self.online or dps:
+        if online != self.online or (dps and avisar):
             self.online = online
             self.ao_estado(self.info["id"],
                            ler_estado(self.dps, self.info.get("v2", True)) if online else None)
@@ -245,7 +247,7 @@ class Luz(threading.Thread):
                     self._ultimo_envio = time.monotonic()
                     if isinstance(r, dict) and r.get("Error"):
                         raise IOError(r.get("Error"))
-                    self._marcar(True, pend)
+                    self._marcar(True, pend, avisar=False)
                 if ler:
                     self._ultima_leitura = time.monotonic()
                     st = self._dev.status()

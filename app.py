@@ -20,7 +20,7 @@ from tkinter import colorchooser
 import pystray
 from PIL import Image, ImageDraw
 
-from papel_parede import capturar, cor_para_leds
+from papel_parede import capturar, cor_para_leds, cores_por_led, preparar_layout, reduzir
 from rgb_core import PASTA, Controlador, log
 
 CONFIG = os.path.join(PASTA, "config.json")
@@ -92,23 +92,62 @@ def ouvir_outras_copias(ao_mostrar):
 
 # ------------------------------------------------------------- SDKs (thread única)
 class Trabalhador(threading.Thread):
+    """Todas as chamadas aos SDKs acontecem aqui, numa thread só.
+
+    Modo papel de parede (self.papel != None), ~12 vezes por segundo:
+      - captura o papel de parede;
+      - Corsair: cada LED recebe a cor da região do papel de parede que corresponde
+        à posição física dele (RAM em coluna, fans em sequência...);
+      - MSI (que só aceita 1 cor por zona e é lenta): recebe a cor geral a cada 2 s,
+        só quando ela muda de verdade.
+    """
+
+    FPS = 12
+    SUAVIDADE = 0.35          # 0..1: quanto cada quadro novo pesa (menos = mais suave)
+    GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
+    LIMIAR_GERAL = 20
+
     def __init__(self, ao_status):
         super().__init__(daemon=True)
         self.fila = queue.Queue()
         self.ao_status = ao_status
         self.ctrl = Controlador()
+        self.papel = None             # {"monitor": ..., "brilho": 0..100} ou None
+        self._layouts = {}
+        self._layouts_de = None
+        self._suave = {}
+        self._geral_t = 0.0
+        self._geral_enviada = None
+        self._erro_t = 0.0
+
+    def ativar_papel(self, monitor, brilho):
+        self.papel = {"monitor": monitor, "brilho": brilho}
+        self._geral_t = 0.0               # força atualizar MSI/janela já
+        self._geral_enviada = None
+        self._primeiro = True
+        self.fila.put(("acordar", None))  # sai da espera longa e começa já
+
+    def ajustar_brilho(self, brilho):
+        if self.papel:
+            self.papel = {**self.papel, "brilho": brilho}
+            self._geral_enviada = None    # MSI pega o brilho novo na próxima rodada
 
     def run(self):
         status = self.ctrl.conectar()
         self.ao_status("conexao", status)
-        tentativas = 0
+        tentativas, ultima_tentativa = 0, time.monotonic()
         while True:
+            espera = 1 / self.FPS if self.papel else 10
             try:
-                cmd, arg = self.fila.get(timeout=10)
+                cmd, arg = self.fila.get(timeout=espera)
             except queue.Empty:
-                # No boot o iCUE pode subir depois do app: tenta de novo.
-                if any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS:
+                if self.papel:
+                    self._quadro()
+                # No boot o iCUE pode subir depois do app: tenta de novo a cada 10 s.
+                if (any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS
+                        and time.monotonic() - ultima_tentativa > 10):
                     tentativas += 1
+                    ultima_tentativa = time.monotonic()
                     status = self.ctrl.conectar()
                     log.info("reconexão %d: %s", tentativas, status)
                     self.ao_status("conexao", status)
@@ -116,65 +155,66 @@ class Trabalhador(threading.Thread):
             if cmd == "sair":
                 self.ctrl.desconectar()
                 return
-            # Se chegaram vários pedidos de cor seguidos (arrastando o brilho), só o último vale.
+            # Vários pedidos de cor seguidos (arrastando o brilho): só o último vale.
             while cmd == "cor" and not self.fila.empty() and self.fila.queue[0][0] == "cor":
                 cmd, arg = self.fila.get()
             if cmd == "cor":
                 self.ao_status("resultado", self.ctrl.aplicar(*arg))
-            elif cmd == "transicao":
-                self._transicao(*arg)
             elif cmd == "restaurar":
                 self.ao_status("restaurar", self.ctrl.restaurar_msi())
 
-    def _transicao(self, de, para, passos=12):
-        """Desliza a cor da Corsair suavemente (~1 s); a MSI recebe só a cor final."""
-        for i in range(1, passos):
-            if not self.fila.empty():          # chegou pedido novo: pula pro fim
-                break
-            t = i / passos
-            meio = tuple(round(a + (b - a) * t) for a, b in zip(de, para))
-            self.ctrl.aplicar(*meio, so_corsair=True)
-            time.sleep(0.08)
-        self.ao_status("resultado", self.ctrl.aplicar(*para))
+    # ---- modo papel de parede
+    def _quadro(self):
+        cfg = self.papel
+        if not cfg:
+            return
+        try:
+            img, fonte = capturar(cfg["monitor"])
+            if img is None:
+                if time.monotonic() - self._geral_t > self.GERAL_A_CADA:
+                    self._geral_t = time.monotonic()
+                    self.ao_status("papel_info", fonte)
+                return
+            peq = reduzir(img)
+            k = cfg["brilho"] / 100
 
+            cors = self.ctrl.corsair()
+            if cors:
+                if self._layouts_de is not cors.posicoes:
+                    self._layouts = {d: preparar_layout(pos)
+                                     for d, (_, pos) in cors.posicoes.items() if pos}
+                    self._layouts_de = cors.posicoes
+                    self._suave = {}
+                a = self.SUAVIDADE
+                mapa = {}
+                for dev_id, lay in self._layouts.items():
+                    leds = []
+                    for led_id, cor in cores_por_led(peq, lay):
+                        ant = self._suave.get((dev_id, led_id))
+                        if ant is not None:
+                            cor = tuple(p + (c - p) * a for p, c in zip(ant, cor))
+                        self._suave[(dev_id, led_id)] = cor
+                        leds.append((led_id, tuple(round(c * k) for c in cor)))
+                    mapa[dev_id] = leds
+                cors.aplicar_por_led(mapa)
+                if getattr(self, "_primeiro", False):
+                    self._primeiro = False
+                    log.info("papel de parede ao vivo: %s, %s",
+                             fonte, {d: f"{l[0]}x{l[1]}" for d, l in self._layouts.items()})
 
-# ------------------------------------------------------------- papel de parede
-class Observador(threading.Thread):
-    """A cada 2 s olha o papel de parede e, se a cor mudou de verdade, avisa o app."""
-
-    INTERVALO = 2.0
-    LIMIAR = 20          # diferença mínima (RGB) para trocar — evita piscar em vídeo
-
-    def __init__(self, app):
-        super().__init__(daemon=True)
-        self.app = app
-        self.forcar = threading.Event()
-
-    def run(self):
-        media, enviada = None, None
-        while True:
-            self.forcar.wait(self.INTERVALO)
-            forcado = self.forcar.is_set()
-            self.forcar.clear()
-            if self.app.cfg.get("modo") != "papel_parede":
-                media, enviada = None, None
-                continue
-            try:
-                img, fonte = capturar(self.app.cfg.get("monitor", "ambos"))
-                if img is None:
-                    self.app.root.after(0, self.app.info_papel, fonte)
-                    continue
-                cor = cor_para_leds(img)
-            except Exception:
-                log.exception("falha ao ler papel de parede")
-                continue
-            # média móvel: vídeos mudam a cada quadro, os LEDs não precisam
-            media = cor if (media is None or forcado) else tuple(
-                round(0.5 * a + 0.5 * b) for a, b in zip(media, cor))
-            dif = max(abs(a - b) for a, b in zip(media, enviada)) if enviada else 999
-            if forcado or dif > self.LIMIAR:
-                enviada = media
-                self.app.root.after(0, self.app.cor_do_papel, media, fonte)
+            agora = time.monotonic()
+            if agora - self._geral_t >= self.GERAL_A_CADA:
+                self._geral_t = agora
+                geral = cor_para_leds(peq)
+                env = self._geral_enviada
+                if env is None or max(abs(x - y) for x, y in zip(geral, env)) > self.LIMIAR_GERAL:
+                    self._geral_enviada = geral
+                    self.ctrl.aplicar(*(round(c * k) for c in geral), so_msi=True)
+                    self.ao_status("papel_cor", (geral, fonte))
+        except Exception:
+            if time.monotonic() - self._erro_t > 30:     # não lotar o log
+                self._erro_t = time.monotonic()
+                log.exception("falha no quadro do papel de parede")
 
 
 # ------------------------------------------------------------- janela + bandeja
@@ -183,7 +223,7 @@ class App:
         self.root = root
         self.cfg = ler_config()
         self.cfg.setdefault("modo", "fixo")            # "fixo" | "papel_parede"
-        self.cfg.setdefault("monitor", "ambos")        # "ambos" | "principal" | "secundario"
+        self.cfg.setdefault("monitor", "principal")        # "ambos" | "principal" | "secundario"
         # o que está nos LEDs agora (antes do brilho)
         self.cor_atual = (self.cfg.get("cor_papel", self.cfg["cor"])
                           if self.cfg["modo"] == "papel_parede" else self.cfg["cor"])
@@ -206,8 +246,6 @@ class App:
 
         self.trab = Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d))
         self.trab.start()
-        self.obs = Observador(self)
-        self.obs.start()
         self._atualizar_modo_ui()
 
     # ---- montagem
@@ -338,29 +376,34 @@ class App:
         return tuple(round(int(h[i:i + 2], 16) * k) for i in (0, 2, 4))
 
     def enviar(self):
-        if not self.pronto:
-            return
+        """Manda o estado atual pro trabalhador (cor fixa ou papel de parede)."""
         self.cfg["brilho"] = self.brilho.get()
         salvar_config(self.cfg)
-        self.trab.fila.put(("cor", self._com_brilho(self.cor_atual)))
+        if not self.pronto:
+            return
+        if self.cfg["modo"] == "papel_parede":
+            if self.trab.papel and self.trab.papel["monitor"] == self.cfg["monitor"]:
+                self.trab.ajustar_brilho(self.cfg["brilho"])
+            else:
+                self.trab.ativar_papel(self.cfg["monitor"], self.cfg["brilho"])
+        else:
+            self.trab.papel = None
+            self.trab.fila.put(("cor", self._com_brilho(self.cor_atual)))
 
     # ---- papel de parede
     def mudar_modo(self):
         self.cfg["modo"] = self.var_modo.get()
-        salvar_config(self.cfg)
         self._atualizar_modo_ui()
         if self.cfg["modo"] == "fixo":
             self._mostrar_cor(self.cfg["cor"])
-            self.enviar()
         else:
             self.lbl_fonte.configure(text="lendo papel de parede…")
-            self.obs.forcar.set()
+        self.enviar()
         self.icon.update_menu()
 
     def mudar_monitor(self, nome):
         self.cfg["monitor"] = self.MONITORES[nome]
-        salvar_config(self.cfg)
-        self.obs.forcar.set()
+        self.enviar()
 
     def _atualizar_modo_ui(self):
         papel = self.cfg["modo"] == "papel_parede"
@@ -369,19 +412,26 @@ class App:
             self.lbl_fonte.configure(text="")
 
     def cor_do_papel(self, rgb, fonte):
+        """Só visual: a cor geral (a que vai pra MSI) aparece na amostra/bandeja."""
         if self.cfg["modo"] != "papel_parede":
             return
         hexa = "#%02x%02x%02x" % rgb
-        anterior = self._com_brilho(self.cor_atual)
         self._mostrar_cor(hexa)
         self.cfg["cor_papel"] = hexa
         salvar_config(self.cfg)
-        self.lbl_fonte.configure(text=f"fonte: {fonte}")
-        if self.pronto:
-            self.trab.fila.put(("transicao", (anterior, self._com_brilho(hexa))))
+        self.lbl_fonte.configure(text=f"ao vivo · {fonte}")
 
     def info_papel(self, texto):
         self.lbl_fonte.configure(text=texto)
+
+    def _texto_status_papel(self):
+        linhas = [f"… {m}: {s}" for m, s in self.conexao.items() if s != "ok"]
+        if self.conexao.get("Corsair (iCUE)") == "ok":
+            linhas.append("✓ Corsair: cada LED com sua cor (ao vivo)")
+        if self.conexao.get("MSI (Mystic Light)") == "ok":
+            linhas.append("✓ MSI: cor geral do papel de parede")
+        linhas.append("– HyperX: ainda não suportado")
+        return "\n".join(linhas)
 
     def restaurar(self):
         self.trab.fila.put(("restaurar", None))
@@ -422,6 +472,11 @@ class App:
             self.status.configure(text="\n".join(linhas))
         elif tipo == "restaurar":
             self.status.configure(text=f"MSI: {dados}\n(Corsair segue a cor do app)")
+        elif tipo == "papel_cor":
+            self.cor_do_papel(*dados)
+            self.status.configure(text=self._texto_status_papel())
+        elif tipo == "papel_info":
+            self.info_papel(dados)
 
 
 TAREFA = "RGB Sync"

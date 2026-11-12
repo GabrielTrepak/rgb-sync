@@ -200,6 +200,45 @@ def cor_para_leds(img):
     return round(r * 255), round(g * 255), round(b * 255)
 
 
+# ------------------------------------------------------------- cor por LED
+def reduzir(img, largura=384):
+    """Imagem pequena (rápida de processar) mantendo a proporção."""
+    fator = max(1, img.width // largura)
+    return img.reduce(fator) if fator > 1 else img
+
+
+def preparar_layout(posicoes):
+    """posicoes: [(led_id, cx, cy)] do iCUE (em mm, layout físico do dispositivo).
+
+    Transforma em uma grade: cada x distinto vira uma coluna e cada y distinto uma
+    linha. Ex.: RAM = 2 colunas (pentes) × 10 linhas; hub LINK = 210 colunas × 1 linha.
+    Depois cada LED pega a MÉDIA da região correspondente do papel de parede.
+    """
+    xs = sorted({round(cx, 1) for _, cx, _ in posicoes})
+    ys = sorted({round(cy, 1) for _, _, cy in posicoes})
+    col = {x: i for i, x in enumerate(xs)}
+    lin = {y: i for i, y in enumerate(ys)}
+    leds = [(i, col[round(cx, 1)], lin[round(cy, 1)]) for i, cx, cy in posicoes]
+    return len(xs), len(ys), leds
+
+
+def realcar(rgb):
+    """Papel de parede na tela fica 'apagado' em LED: puxa saturação e brilho,
+    mas mantém o escuro escuro (céu noturno não vira cinza)."""
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+    s = min(1.0, s * 1.6)
+    v = v ** 0.6 if v > 0.03 else v
+    return tuple(round(c * 255) for c in colorsys.hsv_to_rgb(h, s, v))
+
+
+def cores_por_led(img_pequena, layout):
+    """Devolve [(led_id, (r, g, b))] para um dispositivo."""
+    ncol, nlin, leds = layout
+    grade = img_pequena.resize((ncol, nlin), Image.Resampling.BOX)
+    px = grade.load()
+    return [(i, realcar(px[c, l])) for i, c, l in leds]
+
+
 def paleta_debug(img, n=8):
     peq = img.convert("RGB").resize((192, 54))
     q = peq.quantize(colors=n, method=Image.Quantize.MEDIANCUT)

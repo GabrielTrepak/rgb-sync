@@ -12,8 +12,11 @@ Corsair e MSI, usando só as APIs oficiais dos fabricantes.
 ## Modos
 
 - **Cor fixa** — escolha uma cor (ou um preset) e o PC inteiro fica nela.
-- **Seguir papel de parede** — a cada 2 s o app olha o papel de parede e usa a cor
-  que mais o representa, com transição suave. Funciona com o **Wallpaper Engine**
+- **Seguir papel de parede** — ao vivo (~12 quadros/s, ~0,3% de CPU). Na Corsair,
+  **cada LED recebe a cor da região do papel de parede que corresponde à posição física
+  dele** (ex.: cada pente de RAM vira uma faixa vertical da tela, em degradê; as fans do
+  hub LINK pegam pedaços da esquerda para a direita). A MSI, que só aceita uma cor por
+  zona, recebe a cor geral do papel de parede a cada 2 s. Funciona com o **Wallpaper Engine**
   (captura a janela onde ele desenha, então janelas abertas por cima não atrapalham;
   funciona com vídeo, cena e playlist) e com o papel de parede normal do Windows.
   Dá pra escolher os dois monitores, só o principal ou só o secundário.

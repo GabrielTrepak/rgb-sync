@@ -45,12 +45,14 @@ class Corsair:
     def __init__(self):
         self.sdk = None
         self.dispositivos = []   # [(device_id, modelo, [led_ids])]
+        self.posicoes = {}
         self.erro = None
 
     def conectar(self, timeout=10):
         from cuesdk import (CueSdk, CorsairAccessLevel, CorsairDeviceFilter,
                             CorsairDeviceType, CorsairSessionState)
         self.dispositivos = []
+        self.posicoes = {}       # device_id -> (modelo, [(led_id, cx, cy)])
         self.sdk = CueSdk()
         ok = threading.Event()
 
@@ -71,13 +73,22 @@ class Corsair:
         for d in devs or []:
             leds, _ = self.sdk.get_led_positions(d.device_id)
             ids = [l.id for l in (leds or [])]
+            posicoes = [(l.id, l.cx, l.cy) for l in (leds or [])]
             # Controle exclusivo SÓ de iluminação: os efeitos do iCUE param enquanto o
             # app estiver aberto. Ventilação e bomba continuam com o iCUE.
             err = self.sdk.request_control(
                 d.device_id, CorsairAccessLevel.CAL_ExclusiveLightingControl)
             log.info("Corsair: %s, %d LEDs, request_control=%s", d.model, len(ids), err)
             self.dispositivos.append((d.device_id, d.model, ids))
+            self.posicoes[d.device_id] = (d.model, posicoes)
         return True
+
+    def aplicar_por_led(self, mapa):
+        """mapa: {device_id: [(led_id, (r, g, b)), ...]} — cada LED com sua cor."""
+        from cuesdk import CorsairLedColor
+        for dev_id, leds in mapa.items():
+            self.sdk.set_led_colors(dev_id, [CorsairLedColor(id=i, r=c[0], g=c[1], b=c[2], a=255)
+                                             for i, c in leds])
 
     def aplicar(self, r, g, b):
         from cuesdk import CorsairLedColor
@@ -283,12 +294,18 @@ class Controlador:
             status[b.nome] = "ok" if ok else b.erro
         return status
 
-    def aplicar(self, r, g, b, so_corsair=False):
-        """so_corsair: usado nos passos intermediários de transição (a MSI leva
-        ~0,6 s por mudança, então ela só recebe a cor final)."""
+    def corsair(self):
+        return next((b for b in self.ativos if isinstance(b, Corsair)), None)
+
+    def aplicar(self, r, g, b, so_corsair=False, so_msi=False):
+        """so_corsair: passos intermediários de transição (a MSI leva ~0,6 s por
+        mudança, então ela só recebe a cor final). so_msi: modo papel de parede,
+        em que a Corsair é pintada LED a LED e a MSI recebe a cor geral."""
         res = {}
         for be in self.ativos:
             if so_corsair and not isinstance(be, Corsair):
+                continue
+            if so_msi and not isinstance(be, MSI):
                 continue
             try:
                 res.update(be.aplicar(r, g, b))

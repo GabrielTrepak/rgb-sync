@@ -60,31 +60,40 @@ class _MONITORINFO(ctypes.Structure):
 
 
 # ------------------------------------------------------------- Wallpaper Engine
-def _janela_wallpaper_engine():
+def _janela_wallpaper_engine(com_raiz=False):
+    """Janela onde o Wallpaper Engine desenha. Vídeo: WPEVideoWallpaper; cena/web:
+    WPEDesktopDX11Window (e outras WPE*). Com com_raiz=True devolve (janela, raiz),
+    onde raiz é a camada da área de trabalho que a contém (Progman ou WorkerW)."""
     achadas = []
+    raiz_atual = [None]
 
     def cb(h, _):
         cls = ctypes.create_unicode_buffer(64)
         u32.GetClassNameW(h, cls, 64)
-        if cls.value.startswith("WPE") and cls.value.endswith("Wallpaper") \
-                and u32.IsWindowVisible(h):
-            achadas.append(h)
+        if cls.value.startswith("WPE") and u32.IsWindowVisible(h):
+            r = W.RECT()
+            u32.GetClientRect(h, ctypes.byref(r))
+            achadas.append((r.right * r.bottom, h, raiz_atual[0]))
         return True
 
-    for raiz in ("Progman",):
-        p = u32.FindWindowW(raiz, None)
-        if p:
-            u32.EnumChildWindows(p, EnumProc(cb), 0)
+    p = u32.FindWindowW("Progman", None)
+    if p:
+        raiz_atual[0] = p
+        u32.EnumChildWindows(p, EnumProc(cb), 0)
     # Em algumas versões do Windows ele fica dentro de um WorkerW de topo
     if not achadas:
         def topo(h, _):
             cls = ctypes.create_unicode_buffer(64)
             u32.GetClassNameW(h, cls, 64)
             if cls.value == "WorkerW":
+                raiz_atual[0] = h
                 u32.EnumChildWindows(h, EnumProc(cb), 0)
             return True
         u32.EnumWindows(EnumProc(topo), 0)
-    return achadas[0] if achadas else None
+    if not achadas:
+        return (None, None) if com_raiz else None
+    _, h, raiz = max(achadas)                          # a maior (a que cobre a tela)
+    return (h, raiz) if com_raiz else h
 
 
 def _capturar_janela(hwnd):
@@ -202,6 +211,9 @@ class Capturador:
         self.buf = ctypes.create_string_buffer(self.LARGURA * self.ALTURA * 4)
         self.bmi = _BMI(ctypes.sizeof(_BMI), self.LARGURA, -self.ALTURA, 1, 32, 0, 0, 0, 0, 0, 0)
         self.windows_cache = (None, None)   # (mtime, imagem pequena)
+        self.raiz = None
+        self.modo = "janela"
+        self.lento = False
 
     def _liberar_grande(self):
         if self.grande:
@@ -258,29 +270,58 @@ class Capturador:
             self.windows_cache = (mt, pequena)
         return self.windows_cache[1]
 
+    def _ler(self, alvo, flag, qual):
+        """PrintWindow(alvo) → reduz no Windows → imagem 192×108 (ou None)."""
+        r = W.RECT()
+        u32.GetClientRect(alvo, ctypes.byref(r))
+        w, h = r.right, r.bottom
+        if w <= 0 or h <= 0:
+            return None
+        mem = self._buffers(alvo, w, h)
+        if not u32.PrintWindow(alvo, mem, flag):
+            return None
+        x, y, cw, ch = self._regiao(alvo, w, h, qual)
+        g32.StretchBlt(self.mem_p, 0, 0, self.LARGURA, self.ALTURA, mem, x, y, cw, ch, SRCCOPY)
+        g32.GetDIBits(self.mem_p, self.bmp_p, 0, self.ALTURA, self.buf, ctypes.byref(self.bmi), 0)
+        return Image.frombuffer("RGB", (self.LARGURA, self.ALTURA), self.buf,
+                                "raw", "BGRX", 0, 1).copy()
+
+    @staticmethod
+    def _preta(img):
+        return max(img.getextrema(), key=lambda e: e[1])[1] < 6
+
     def capturar(self, qual="principal"):
-        """Devolve (imagem 192×108, fonte) ou (None, motivo)."""
+        """Devolve (imagem 192×108, fonte) ou (None, motivo).
+
+        Dois jeitos de ler o Wallpaper Engine:
+          - "janela": PrintWindow na janela dele. Rápido (~2 ms), funciona com vídeo.
+          - "area": cenas/web usam DirectX e a janela volta PRETA; aí lemos a camada
+            da área de trabalho com PW_RENDERFULLCONTENT (~20 ms). Janelas abertas
+            continuam de fora; os ícones da área de trabalho entram, mas são pequenos.
+        self.lento fica True no modo "area" (o laço ao vivo diminui o ritmo).
+        """
         antigo = u32.SetThreadDpiAwarenessContext(PER_MONITOR_V2)
         try:
             agora = time.monotonic()
             if (not self.hwnd or agora - self.hwnd_t > 2 or not u32.IsWindow(self.hwnd)):
-                self.hwnd, self.hwnd_t = _janela_wallpaper_engine(), agora
+                novo, raiz = _janela_wallpaper_engine(com_raiz=True)
+                if novo != self.hwnd:
+                    self.modo = "janela"           # janela nova: tenta o jeito rápido primeiro
+                self.hwnd, self.raiz, self.hwnd_t = novo, raiz, agora
             if self.hwnd:
-                r = W.RECT()
-                u32.GetClientRect(self.hwnd, ctypes.byref(r))
-                w, h = r.right, r.bottom
-                if w > 0 and h > 0:
-                    mem = self._buffers(self.hwnd, w, h)
-                    if u32.PrintWindow(self.hwnd, mem, 0):
-                        x, y, cw, ch = self._regiao(self.hwnd, w, h, qual)
-                        g32.StretchBlt(self.mem_p, 0, 0, self.LARGURA, self.ALTURA,
-                                       mem, x, y, cw, ch, SRCCOPY)
-                        g32.GetDIBits(self.mem_p, self.bmp_p, 0, self.ALTURA, self.buf,
-                                      ctypes.byref(self.bmi), 0)
-                        img = Image.frombuffer("RGB", (self.LARGURA, self.ALTURA), self.buf,
-                                               "raw", "BGRX", 0, 1).copy()
-                        return img, "Wallpaper Engine"
+                img = None
+                if getattr(self, "modo", "janela") == "janela":
+                    img = self._ler(self.hwnd, 0, qual)
+                    if img is not None and self._preta(img) and self.raiz:
+                        self.modo = "area"         # DirectX: a janela vem preta
+                        img = None
+                if img is None and self.modo == "area" and self.raiz:
+                    img = self._ler(self.raiz, 2, qual)
+                self.lento = self.modo == "area"
+                if img is not None:
+                    return img, "Wallpaper Engine" + (" (cena)" if self.lento else "")
                 self.hwnd = None                     # falhou: procura de novo
+            self.lento = False
             img = self._windows()
             if img is not None:
                 return img, "Windows"

@@ -95,6 +95,8 @@ def ouvir_outras_copias(ao_mostrar, ao_sair=None):
                     ao_mostrar()
                 elif msg == b"sair" and ao_sair:
                     ao_sair()
+                elif msg.startswith(b"aba:") and ao_mostrar:   # abre numa aba (atalhos/testes)
+                    ao_mostrar(msg[4:].decode("utf-8", "replace"))
                 elif msg == b"diag":                     # diagnóstico local
                     import logging
                     info = {"pid": os.getpid(), "exe": sys.executable, "dados": CONFIG,
@@ -257,17 +259,21 @@ class Trabalhador(threading.Thread):
 
     FPS = 12
     FPS_PARADO = 4
+    FPS_CENA = 6              # papéis de parede tipo "cena" (captura mais cara)
+    FPS_CENA_PARADO = 2
     LIMIAR_IMAGEM = 0.6       # diferença média mínima (0..255) para considerar que mudou
     SUAVIDADE = 0.35          # 0..1: quanto cada quadro novo pesa (menos = mais suave)
     GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
     LIMIAR_GERAL = 20
     PREVIEW_A_CADA = 0.2      # s, prévia dos LEDs na janela (só com a janela aberta)
 
-    def __init__(self, ao_status):
+    def __init__(self, ao_status, desligados=()):
         super().__init__(daemon=True)
         self.fila = queue.Queue()
         self.ao_status = ao_status
         self.ctrl = Controlador()
+        self.ctrl.definir_desligados(desligados)
+        self._ultima_cor = None       # última cor fixa enviada (para reenviar)
         self.papel = None             # {"monitor": ..., "brilho": 0..100} ou None
         self.preview_ligado = False   # a interface liga quando a janela está visível
         self._layouts = {}
@@ -312,19 +318,42 @@ class Trabalhador(threading.Thread):
         self.papel = None
         self.fila.put(("cor", rgb))
 
+    def desligar_dispositivos(self, chaves):
+        self.fila.put(("desligados", set(chaves)))
+
+    def recarregar(self):
+        self.fila.put(("recarregar", None))
+
+    def _reenviar(self):
+        """Manda tudo de novo (depois de recarregar ou (des)ligar aparelhos)."""
+        self._layouts_de = None
+        self._img_anterior = None
+        if self.papel:
+            self._forcar_envio = True
+            self._parado = 0
+            self._geral_enviada = None
+            self._geral_t = 0.0
+        elif self._ultima_cor is not None:
+            self.ao_status("resultado", self.ctrl.aplicar(*self._ultima_cor))
+
     # ---- laço principal
     def run(self):
         status = self.ctrl.conectar()
         self._anunciar_layouts()
         self.ao_status("conexao", status)
+        self.ao_status("dispositivos", self.ctrl.listar())
         tentativas, ultima_tentativa = 0, time.monotonic()
         while True:
+            # papel de parede "cena" (DirectX) custa ~20 ms por captura: ritmo menor
+            lento = bool(self._cap and self._cap.lento)
+            fps = self.FPS_CENA if lento else self.FPS
+            fps_parado = self.FPS_CENA_PARADO if lento else self.FPS_PARADO
             if not self.papel:
                 espera = 10
-            elif self._parado >= self.FPS:
-                espera = 1 / self.FPS_PARADO
+            elif self._parado >= fps:
+                espera = 1 / fps_parado
             else:
-                espera = 1 / self.FPS
+                espera = 1 / fps
             try:
                 cmd, arg = self.fila.get(timeout=espera)
             except queue.Empty:
@@ -339,6 +368,7 @@ class Trabalhador(threading.Thread):
                     log.info("reconexão %d: %s", tentativas, status)
                     self._anunciar_layouts()
                     self.ao_status("conexao", status)
+                    self.ao_status("dispositivos", self.ctrl.listar())
                 continue
             if cmd == "sair":
                 self.ctrl.desconectar()
@@ -347,9 +377,23 @@ class Trabalhador(threading.Thread):
             while cmd == "cor" and not self.fila.empty() and self.fila.queue[0][0] == "cor":
                 cmd, arg = self.fila.get()
             if cmd == "cor":
+                self._ultima_cor = arg
                 self.ao_status("resultado", self.ctrl.aplicar(*arg))
             elif cmd == "restaurar":
                 self.ao_status("restaurar", self.ctrl.restaurar_msi())
+            elif cmd == "desligados":
+                self.ctrl.definir_desligados(arg)
+                self.ao_status("dispositivos", self.ctrl.listar())
+                self._anunciar_layouts()
+                self._reenviar()
+            elif cmd == "recarregar":
+                status = self.ctrl.recarregar()
+                tentativas = 0
+                self._anunciar_layouts()
+                self.ao_status("conexao", status)
+                self.ao_status("dispositivos", self.ctrl.listar())
+                self._reenviar()
+                self.ao_status("recarregado", status)
 
     def _anunciar_layouts(self):
         """Manda pra interface o desenho de cada dispositivo (para a prévia)."""
@@ -359,9 +403,10 @@ class Trabalhador(threading.Thread):
             for dev_id, (modelo, pos) in cors.posicoes.items():
                 if pos:
                     ncol, nlin, leds = preparar_layout(pos)
-                    lista.append((dev_id, modelo, ncol, nlin, leds))
-        msi = [nome for b in self.ctrl.ativos if b.__class__.__name__ == "MSI"
-               for nome in ("Placa-mãe", "Placa de vídeo")]
+                    lista.append((dev_id, modelo, ncol, nlin, leds, cors.chaves[dev_id],
+                                  cors.ativo(dev_id)))
+        msi = [(d["nome"].split(" (")[0], d["chave"], d["ativo"])
+               for d in self.ctrl.listar() if d["marca"] == "MSI"]
         self.ao_status("layouts", {"corsair": lista, "msi": msi})
 
     # ---- modo papel de parede
@@ -399,6 +444,8 @@ class Trabalhador(threading.Thread):
                 estavel = True
                 mapa = {}
                 for dev_id, lay in self._layouts.items():
+                    if not cors.ativo(dev_id):
+                        continue
                     leds, mudou_disp = [], False
                     for led_id, alvo in cores_por_led(peq, lay):
                         chave = (dev_id, led_id)

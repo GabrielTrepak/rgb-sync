@@ -78,6 +78,8 @@ class Corsair:
         self.sdk = None
         self.dispositivos = []   # [(device_id, modelo, [led_ids])]
         self.posicoes = {}
+        self.chaves = {}         # device_id -> "corsair:<modelo>"
+        self.desligados = set()  # chaves que o usuário tirou da sincronização
         self.erro = None
 
     def conectar(self, timeout=10):
@@ -85,6 +87,8 @@ class Corsair:
                             CorsairDeviceType, CorsairSessionState)
         self.dispositivos = []
         self.posicoes = {}       # device_id -> (modelo, [(led_id, cx, cy)])
+        self.chaves = {}
+        self._controlados = set()
         self.sdk = CueSdk()
         ok = threading.Event()
 
@@ -106,19 +110,56 @@ class Corsair:
             leds, _ = self.sdk.get_led_positions(d.device_id)
             ids = [l.id for l in (leds or [])]
             posicoes = [(l.id, l.cx, l.cy) for l in (leds or [])]
-            # Controle exclusivo SÓ de iluminação: os efeitos do iCUE param enquanto o
-            # app estiver aberto. Ventilação e bomba continuam com o iCUE.
-            err = self.sdk.request_control(
-                d.device_id, CorsairAccessLevel.CAL_ExclusiveLightingControl)
-            log.info("Corsair: %s, %d LEDs, request_control=%s", d.model, len(ids), err)
+            chave = f"corsair:{d.model}"
+            n = 2
+            while chave in self.chaves.values():          # dois aparelhos iguais
+                chave, n = f"corsair:{d.model} #{n}", n + 1
+            self.chaves[d.device_id] = chave
             self.dispositivos.append((d.device_id, d.model, ids))
             self.posicoes[d.device_id] = (d.model, posicoes)
+            log.info("Corsair: %s, %d LEDs", d.model, len(ids))
+        self._aplicar_controle()
         return True
+
+    def _aplicar_controle(self):
+        """Controle exclusivo SÓ de iluminação nos aparelhos ligados: os efeitos do
+        iCUE param neles. Nos desligados, o controle volta pro iCUE (efeitos dele).
+        Ventilação e bomba continuam sempre com o iCUE."""
+        from cuesdk import CorsairAccessLevel
+        if not hasattr(self, "_controlados"):
+            self._controlados = set()
+        for dev_id, modelo, _ in self.dispositivos:
+            quer = self.chaves[dev_id] not in self.desligados
+            if quer == (dev_id in self._controlados):
+                continue                                   # nada mudou nesse aparelho
+            if quer:
+                err = self.sdk.request_control(
+                    dev_id, CorsairAccessLevel.CAL_ExclusiveLightingControl)
+                self._controlados.add(dev_id)
+                log.info("Corsair: %s sincronizando (request_control=%s)", modelo, err)
+            else:
+                err = self.sdk.release_control(dev_id)
+                self._controlados.discard(dev_id)
+                log.info("Corsair: %s desligado da sincronização (%s)", modelo, err)
+
+    def definir_desligados(self, chaves):
+        self.desligados = {c for c in chaves if c.startswith("corsair:")}
+        if self.sdk:
+            self._aplicar_controle()
+
+    def ativo(self, dev_id):
+        return self.chaves.get(dev_id) not in self.desligados
+
+    def listar(self):
+        return [{"chave": self.chaves[d], "nome": m, "marca": "Corsair", "leds": len(ids),
+                 "ativo": self.ativo(d)} for d, m, ids in self.dispositivos]
 
     def aplicar_por_led(self, mapa):
         """mapa: {device_id: [(led_id, (r, g, b)), ...]} — cada LED com sua cor."""
         from cuesdk import CorsairLedColor
         for dev_id, leds in mapa.items():
+            if not self.ativo(dev_id):
+                continue
             self.sdk.set_led_colors(dev_id, [CorsairLedColor(id=i, r=c[0], g=c[1], b=c[2], a=255)
                                              for i, c in leds])
 
@@ -126,6 +167,8 @@ class Corsair:
         from cuesdk import CorsairLedColor
         res = {}
         for dev_id, modelo, ids in self.dispositivos:
+            if not self.ativo(dev_id):
+                continue
             cores = [CorsairLedColor(id=i, r=r, g=g, b=b, a=255) for i in ids]
             err = self.sdk.set_led_colors(dev_id, cores)
             res[modelo] = str(err).split(".")[-1]
@@ -197,7 +240,25 @@ class MSI:
     def __init__(self):
         self.dll = None
         self.dispositivos = []   # [(tipo, n_leds, {idx: estilo_fixo})]
+        self.nomes_led = {}      # tipo -> [nome de cada zona] (ex.: JRGB1, nome da GPU)
+        self.desligados = set()
         self.erro = None
+
+    def definir_desligados(self, chaves):
+        self.desligados = {c for c in chaves if c.startswith("msi:")}
+
+    def listar(self):
+        out = []
+        for tipo, n, _ in self.dispositivos:
+            nomes = self.nomes_led.get(tipo, [])
+            nome = NOMES_MSI.get(tipo, tipo)
+            if tipo == "MSI_VGA" and nomes and nomes[0]:
+                nome = f"{nome} ({nomes[0]})"
+            elif tipo == "MSI_MB" and nomes:
+                nome = f"{nome} ({', '.join(nomes)})"
+            out.append({"chave": f"msi:{tipo}", "nome": nome, "marca": "MSI", "leds": n,
+                        "ativo": f"msi:{tipo}" not in self.desligados})
+        return out
 
     def conectar(self):
         if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -205,6 +266,7 @@ class MSI:
             log.error("MSI: %s", self.erro)
             return False
         self.dispositivos = []
+        self.nomes_led = {}
         if self.dll is None:
             os.add_dll_directory(os.path.dirname(MLAPI_DLL))
         d = ctypes.WinDLL(MLAPI_DLL)
@@ -241,6 +303,7 @@ class MSI:
                 disponiveis = _ler_safearray(lista)
                 fixo = next((e for e in ESTILOS_FIXOS if e in disponiveis), None)
                 estilos[i] = fixo
+                self.nomes_led.setdefault(tipo, []).append(nome_led)
                 log.info("MSI: %s[%d] '%s' estilos=%s -> fixo=%s",
                          tipo, i, nome_led, disponiveis, fixo)
             self.dispositivos.append((tipo, n, estilos))
@@ -279,6 +342,8 @@ class MSI:
     def aplicar(self, r, g, b):
         res = {}
         for tipo, n, estilos in self.dispositivos:
+            if f"msi:{tipo}" in self.desligados:
+                continue
             codigos = [self._set(tipo, i, estilos[i], r, g, b) for i in range(n)]
             pior = min(min(c) for c in codigos) if codigos else 0
             res[NOMES_MSI.get(tipo, tipo)] = MLAPI_ERROS.get(pior, pior)
@@ -307,6 +372,30 @@ class Controlador:
     def __init__(self):
         self.backends = [Corsair(), MSI()]
         self.ativos = []
+        self.desligados = set()      # chaves "corsair:..."/"msi:..." fora da sincronização
+
+    def definir_desligados(self, chaves):
+        self.desligados = set(chaves)
+        for b in self.backends:
+            try:
+                b.definir_desligados(self.desligados)
+            except Exception:
+                log.exception("falha ao (des)ligar dispositivos em %s", b.nome)
+
+    def listar(self):
+        """Todos os dispositivos que o app controla (ligados ou não)."""
+        out = []
+        for b in self.ativos:
+            out.extend(b.listar())
+        return out
+
+    def recarregar(self):
+        """Desconecta tudo e conecta do zero (acha aparelhos novos, conserta estado
+        estranho). Devolve o status da conexão."""
+        log.info("recarregando tudo")
+        self.desconectar()
+        self.backends = [Corsair(), MSI()]
+        return self.conectar()
 
     def conectar(self):
         """Conecta as marcas que ainda não estão ativas (pode ser chamado de novo
@@ -317,6 +406,7 @@ class Controlador:
                 status[b.nome] = "ok"
                 continue
             try:
+                b.definir_desligados(self.desligados)
                 ok = b.conectar()
             except Exception as e:  # nunca derrubar o app por causa de uma marca
                 log.exception("falha ao conectar %s", b.nome)

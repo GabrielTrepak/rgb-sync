@@ -16,13 +16,24 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
   física dele** (cada pente de RAM vira uma faixa vertical em degradê; as fans do hub LINK pegam
   pedaços da esquerda para a direita). A MSI, que só aceita uma cor por zona, recebe a cor geral
   a cada 2 s. Com a imagem parada (papel estático, Wallpaper Engine pausado num jogo) ele só
-  confere 4×/s e não reenvia nada. Funciona com o **Wallpaper Engine** (captura a janela onde
-  ele desenha — janelas por cima não atrapalham) e com o papel de parede normal do Windows.
-  Monitor: principal, secundário ou os dois.
+  confere 4×/s e não reenvia nada. Funciona com o **Wallpaper Engine** — vídeo (captura a
+  janela onde ele desenha, ~2 ms) e cena/web em DirectX (captura a camada da área de trabalho,
+  ~20 ms, por isso roda a 6 quadros/s) — sem pegar as janelas abertas por cima, e com o papel
+  de parede normal do Windows. Monitor: principal, secundário ou os dois.
 - **Cor fixa** — 9 cores prontas, seletor de cor ou código hex.
 
 > Se usar Wallpaper Engine, desligue o plugin de LED dele (Configurações → Plugins → LED)
 > para ele não disputar o iCUE com o RGB Sync.
+
+## Aba Dispositivos
+
+- **Liga/desliga por aparelho**: o que estiver desligado sai da sincronização (na Corsair, o
+  controle volta pro iCUE e ele mostra os efeitos dele; a MSI fica com a última cor).
+- **Sincronizar tudo de novo**: desconecta e reconecta iCUE e Mystic Light e reenvia as cores
+  (também no menu da bandeja).
+- **Procurar dispositivos**: reconecta os SDKs e lista os equipamentos RGB USB conectados de
+  várias marcas, dizendo se são compatíveis. Aparelho novo ganha o selo **NOVO**; 20 s depois
+  de iniciar o app faz essa busca sozinho e avisa na bandeja se aparecer algo novo.
 
 ## Regras do projeto
 
@@ -64,6 +75,7 @@ No iCUE, o SDK precisa estar ativado.
 - `motor.py` — config, instância única, inicialização com o Windows, laço ao vivo
 - `rgb_core.py` — backends Corsair e MSI
 - `papel_parede.py` — captura do papel de parede e cor por LED
-- `icone.py` — gera o ícone (`assets/`)
+- `busca.py` — procura equipamentos RGB USB (`python busca.py` testa)
+- `icone.py` — gera o ícone da fogueira (`assets/`); o da bandeja tem o núcleo na cor atual
 - `instalar.ps1` — gera o .exe e instala
 - `diagnostico_rgb.py` — diagnóstico somente leitura dos SDKs

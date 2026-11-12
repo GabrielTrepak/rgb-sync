@@ -1,33 +1,33 @@
 """
-RGB Sync — v2 (cor fixa sincronizada + bandeja + iniciar com o Windows).
+RGB Sync — interface (janela + bandeja).
 
 - Fechar a janela só esconde: o app continua na bandeja (perto do relógio).
 - Para sair de verdade: botão direito no ícone da bandeja → Sair.
-- `--bandeja` inicia já escondido (usado na inicialização do Windows).
-- Só roda uma cópia: abrir de novo apenas mostra a janela da que já está rodando.
+- `--bandeja` inicia escondido (usado na inicialização do Windows).
+- Só roda uma cópia; abrir de novo só mostra a janela.
+- Sem administrador: se a inicialização com o Windows está ligada, abre pela tarefa
+  agendada (sem aviso do Windows); senão pede administrador (o SDK da MSI exige).
 """
 
-import json
+import ctypes
 import os
-import queue
-import socket
 import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import colorchooser
 
+import customtkinter as ctk
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image
 
-from PIL import ImageChops, ImageStat
+import motor
+from icone import icone
+from motor import hex_rgb, ler_config, rgb_hex, salvar_config
+from rgb_core import PASTA, log
 
-from papel_parede import Capturador, cor_para_leds, cores_por_led, preparar_layout
-from rgb_core import PASTA, Controlador, log
-
-CONFIG = os.path.join(PASTA, "config.json")
-PORTA_UNICA = 47652          # só para a 2ª cópia avisar a 1ª: "mostre a janela"
-RETENTATIVAS = 18            # 18 x 10 s = 3 min tentando conectar no boot
+VERSAO = "3.0"
+ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
+PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
 PRESETS = [
     ("Branco", "#ffffff"), ("Vermelho", "#ff0000"), ("Laranja", "#ff5a00"),
@@ -35,459 +35,429 @@ PRESETS = [
     ("Azul", "#0050ff"), ("Roxo", "#8000ff"), ("Rosa", "#ff00a0"),
 ]
 
-BG, PAINEL, TEXTO, SUAVE = "#141418", "#1e1e24", "#e8e8ec", "#8a8a96"
+# paleta da interface
+FUNDO = "#101015"
+CARTAO = "#1a1a21"
+BORDA = "#272731"
+TEXTO = "#ececf1"
+SUAVE = "#8c8c9a"
+DESTAQUE = "#7c5cff"
+OK, ALERTA = "#3ddc84", "#ffb74d"
+
+MODOS = {"Papel de parede": "papel_parede", "Cor fixa": "fixo"}
+MONITORES = {"Principal": "principal", "Secundário": "secundario", "Os dois": "ambos"}
+LARGURA = 452
 
 
-def ler_config():
-    try:
-        with open(CONFIG, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"cor": "#0050ff", "brilho": 100}
+def _nome(dic, valor):
+    return next(k for k, v in dic.items() if v == valor)
 
 
-def salvar_config(cfg):
-    try:
-        with open(CONFIG, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        log.exception("falha ao salvar config")
+class Previa(tk.Canvas):
+    """Desenho de 'como estão os LEDs agora': fita do hub, pentes de RAM, headset
+    e as zonas da MSI. Atualiza só as cores (itemconfig), é leve."""
+
+    def __init__(self, master):
+        super().__init__(master, width=LARGURA - 40, height=60, bg=CARTAO,
+                         highlightthickness=0, bd=0)
+        self.itens = {}        # (dev_id, led_id) -> id
+        self.msi = []          # ids das zonas MSI
+        self.todos = []
+
+    def montar(self, layouts):
+        self.delete("all")
+        self.itens, self.msi, self.todos = {}, [], []
+        w = int(self["width"])
+        y = 4
+        fitas = [l for l in layouts["corsair"] if l[3] == 1 and l[2] > 4]
+        blocos = [l for l in layouts["corsair"] if l not in fitas]
+        for dev_id, modelo, ncol, nlin, leds in fitas:
+            nome = "Cooler e fans" if "LINK" in modelo.upper() else modelo
+            self.create_text(0, y, text=nome, anchor="nw", fill=SUAVE, font=("Segoe UI", 9))
+            y += 18
+            cw = w / ncol
+            for led_id, c, _ in leds:
+                i = self.create_rectangle(c * cw, y, (c + 1) * cw + 0.6, y + 22,
+                                          outline="", fill="#333")
+                self.itens.setdefault((dev_id, led_id), i)
+                self.todos.append(i)
+            y += 34
+        # linha de "blocos": RAM, headset, MSI
+        x, topo, alt = 0, y, 92
+        for dev_id, modelo, ncol, nlin, leds in blocos:
+            if ncol * nlin == 1:                          # headset etc.
+                nome = "Headset" if "HS" in modelo.upper() else modelo
+                i = self.create_oval(x + 8, topo + 22, x + 44, topo + 58, outline="", fill="#333")
+                self.itens[(dev_id, leds[0][0])] = i
+                self.todos.append(i)
+                self.create_text(x + 26, topo + alt - 10, text=nome, fill=SUAVE,
+                                 font=("Segoe UI", 9))
+                x += 64
+            else:                                         # RAM (colunas)
+                nome = "Memória RAM" if "DDR" in modelo.upper() or "VENGEANCE" in modelo.upper() \
+                    else modelo
+                bw, gap, ch = 16, 8, (alt - 26) / nlin
+                larg_barras = ncol * bw + (ncol - 1) * gap
+                larg = max(larg_barras, 84)               # cabe o nome embaixo
+                x_barras = x + (larg - larg_barras) / 2
+                for led_id, c, l in leds:
+                    x0 = x_barras + c * (bw + gap)
+                    i = self.create_rectangle(x0, topo + l * ch, x0 + bw, topo + (l + 1) * ch - 1,
+                                              outline="", fill="#333")
+                    self.itens[(dev_id, led_id)] = i
+                    self.todos.append(i)
+                self.create_text(x + larg / 2, topo + alt - 10, text=nome, fill=SUAVE,
+                                 font=("Segoe UI", 9))
+                x += larg + 12
+        for nome in layouts["msi"]:
+            i = self.create_rectangle(x + 10, topo + 14, x + 62, topo + 62, outline="", fill="#333")
+            self.msi.append(i)
+            self.todos.append(i)
+            self.create_text(x + 36, topo + alt - 10, text=nome, fill=SUAVE, font=("Segoe UI", 9))
+            x += 86
+        if layouts["corsair"] or layouts["msi"]:
+            y = topo + alt
+        else:
+            self.create_text(w / 2, 30, text="Conectando aos dispositivos…", fill=SUAVE,
+                             font=("Segoe UI", 10))
+            y = 60
+        self.configure(height=y)
+
+    def tudo(self, hexa):
+        for i in self.todos:
+            self.itemconfig(i, fill=hexa)
+
+    def leds(self, cores):
+        for chave, rgb in cores.items():
+            i = self.itens.get(chave)
+            if i:
+                self.itemconfig(i, fill=rgb_hex(rgb))
+
+    def zonas_msi(self, hexa):
+        for i in self.msi:
+            self.itemconfig(i, fill=hexa)
 
 
-def icone_bandeja(hexa):
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    h = hexa.lstrip("#")
-    rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-    if sum(rgb) < 60:                      # "apagado": mostra um anel cinza
-        d.ellipse((6, 6, 58, 58), outline=(140, 140, 150, 255), width=6)
-    else:
-        d.ellipse((4, 4, 60, 60), fill=rgb + (255,), outline=(20, 20, 24, 255), width=3)
-    return img
-
-
-# ------------------------------------------------------------- instância única
-def ja_esta_rodando():
-    """Se já existe uma cópia, pede pra ela mostrar a janela e devolve True."""
-    try:
-        with socket.create_connection(("127.0.0.1", PORTA_UNICA), timeout=1) as s:
-            s.sendall(b"mostrar")
-        return True
-    except OSError:
-        return False
-
-
-def ouvir_outras_copias(ao_mostrar):
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", PORTA_UNICA))
-    srv.listen(1)
-
-    def loop():
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                if conn.recv(16) == b"mostrar":
-                    ao_mostrar()
-
-    threading.Thread(target=loop, daemon=True).start()
-
-
-# ------------------------------------------------------------- SDKs (thread única)
-class Trabalhador(threading.Thread):
-    """Todas as chamadas aos SDKs acontecem aqui, numa thread só.
-
-    Modo papel de parede (self.papel != None), ~12 vezes por segundo:
-      - captura o papel de parede;
-      - Corsair: cada LED recebe a cor da região do papel de parede que corresponde
-        à posição física dele (RAM em coluna, fans em sequência...);
-      - MSI (que só aceita 1 cor por zona e é lenta): recebe a cor geral a cada 2 s,
-        só quando ela muda de verdade.
-    """
-
-    FPS = 12
-    FPS_PARADO = 4            # quando a imagem não muda (papel estático, jogo em tela cheia)
-    LIMIAR_IMAGEM = 0.6       # diferença média mínima (0..255) para considerar que mudou
-    SUAVIDADE = 0.35          # 0..1: quanto cada quadro novo pesa (menos = mais suave)
-    GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
-    LIMIAR_GERAL = 20
-
-    def __init__(self, ao_status):
-        super().__init__(daemon=True)
-        self.fila = queue.Queue()
-        self.ao_status = ao_status
-        self.ctrl = Controlador()
-        self.papel = None             # {"monitor": ..., "brilho": 0..100} ou None
-        self._layouts = {}
-        self._layouts_de = None
-        self._suave = {}
-        self._geral_t = 0.0
-        self._geral_enviada = None
-        self._erro_t = 0.0
-        self._cap = None
-        self._img_anterior = None
-        self._estavel = False
-        self._enviado = {}
-        self._parado = 0
-        self._primeiro = False
-        self._forcar_envio = True
-
-    def ativar_papel(self, monitor, brilho):
-        self.papel = {"monitor": monitor, "brilho": brilho}
-        self._geral_t = 0.0               # força atualizar MSI/janela já
-        self._geral_enviada = None
-        self._primeiro = True
-        self._forcar_envio = True
-        self._parado = 0
-        self.fila.put(("acordar", None))  # sai da espera longa e começa já
-
-    def ajustar_brilho(self, brilho):
-        if self.papel:
-            self.papel = {**self.papel, "brilho": brilho}
-            self._geral_enviada = None
-            self._forcar_envio = True
-            self._parado = 0    # MSI pega o brilho novo na próxima rodada
-
-    def run(self):
-        status = self.ctrl.conectar()
-        self.ao_status("conexao", status)
-        tentativas, ultima_tentativa = 0, time.monotonic()
-        while True:
-            if not self.papel:
-                espera = 10
-            elif self._parado >= self.FPS:          # ~1 s sem mudança: olha só 4x/s
-                espera = 1 / self.FPS_PARADO
-            else:
-                espera = 1 / self.FPS
-            try:
-                cmd, arg = self.fila.get(timeout=espera)
-            except queue.Empty:
-                if self.papel:
-                    self._parado = self._parado + 1 if self._quadro() else 0
-                # No boot o iCUE pode subir depois do app: tenta de novo a cada 10 s.
-                if (any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS
-                        and time.monotonic() - ultima_tentativa > 10):
-                    tentativas += 1
-                    ultima_tentativa = time.monotonic()
-                    status = self.ctrl.conectar()
-                    log.info("reconexão %d: %s", tentativas, status)
-                    self.ao_status("conexao", status)
-                continue
-            if cmd == "sair":
-                self.ctrl.desconectar()
-                return
-            # Vários pedidos de cor seguidos (arrastando o brilho): só o último vale.
-            while cmd == "cor" and not self.fila.empty() and self.fila.queue[0][0] == "cor":
-                cmd, arg = self.fila.get()
-            if cmd == "cor":
-                self.ao_status("resultado", self.ctrl.aplicar(*arg))
-            elif cmd == "restaurar":
-                self.ao_status("restaurar", self.ctrl.restaurar_msi())
-
-    # ---- modo papel de parede
-    def _quadro(self):
-        """Um quadro do modo ao vivo. Devolve True se a imagem estava parada."""
-        cfg = self.papel
-        if not cfg:
-            return True
-        try:
-            if self._cap is None:
-                self._cap = Capturador()
-            peq, fonte = self._cap.capturar(cfg["monitor"])
-            if peq is None:
-                if time.monotonic() - self._geral_t > self.GERAL_A_CADA:
-                    self._geral_t = time.monotonic()
-                    self.ao_status("papel_info", fonte)
-                return True
-
-            # Imagem igual à anterior (papel estático, Wallpaper Engine pausado no jogo)
-            # e LEDs já assentados: não há nada a fazer neste quadro.
-            ant = self._img_anterior
-            self._img_anterior = peq
-            mudou = (ant is None or max(ImageStat.Stat(ImageChops.difference(ant, peq)).mean)
-                     > self.LIMIAR_IMAGEM)
-            if not mudou and self._estavel and not self._forcar_envio:
-                return True
-
-            k = cfg["brilho"] / 100
-            cors = self.ctrl.corsair()
-            if cors:
-                if self._layouts_de is not cors.posicoes:
-                    self._layouts = {d: preparar_layout(pos)
-                                     for d, (_, pos) in cors.posicoes.items() if pos}
-                    self._layouts_de = cors.posicoes
-                    self._suave, self._enviado = {}, {}
-                a = self.SUAVIDADE
-                estavel = True
-                mapa = {}
-                for dev_id, lay in self._layouts.items():
-                    leds, mudou_disp = [], False
-                    for led_id, alvo in cores_por_led(peq, lay):
-                        chave = (dev_id, led_id)
-                        ant_c = self._suave.get(chave)
-                        cor = alvo if ant_c is None else tuple(
-                            p + (c - p) * a for p, c in zip(ant_c, alvo))
-                        if max(abs(c - t) for c, t in zip(cor, alvo)) > 1:
-                            estavel = False          # ainda deslizando até o alvo
-                        self._suave[chave] = cor
-                        final = tuple(round(c * k) for c in cor)
-                        if self._enviado.get(chave) != final:
-                            mudou_disp = True
-                            self._enviado[chave] = final
-                        leds.append((led_id, final))
-                    if mudou_disp or self._forcar_envio:
-                        mapa[dev_id] = leds
-                if mapa:
-                    cors.aplicar_por_led(mapa)
-                self._estavel = estavel
-                if self._primeiro:
-                    self._primeiro = False
-                    log.info("papel de parede ao vivo: %s, %s",
-                             fonte, {d: f"{l[0]}x{l[1]}" for d, l in self._layouts.items()})
-            self._forcar_envio = False
-
-            agora = time.monotonic()
-            if agora - self._geral_t >= self.GERAL_A_CADA:
-                self._geral_t = agora
-                geral = cor_para_leds(peq)
-                env = self._geral_enviada
-                if env is None or max(abs(x - y) for x, y in zip(geral, env)) > self.LIMIAR_GERAL:
-                    self._geral_enviada = geral
-                    self.ctrl.aplicar(*(round(c * k) for c in geral), so_msi=True)
-                    self.ao_status("papel_cor", (geral, fonte))
-            return not mudou
-        except Exception:
-            if time.monotonic() - self._erro_t > 30:     # não lotar o log
-                self._erro_t = time.monotonic()
-                log.exception("falha no quadro do papel de parede")
-            return False
-
-
-# ------------------------------------------------------------- janela + bandeja
 class App:
     def __init__(self, root, iniciar_escondido):
         self.root = root
         self.cfg = ler_config()
-        self.cfg.setdefault("modo", "fixo")            # "fixo" | "papel_parede"
-        self.cfg.setdefault("monitor", "principal")        # "ambos" | "principal" | "secundario"
-        # o que está nos LEDs agora (antes do brilho)
-        self.cor_atual = (self.cfg.get("cor_papel", self.cfg["cor"])
-                          if self.cfg["modo"] == "papel_parede" else self.cfg["cor"])
         self.conexao = {}
         self.pronto = False
+        self.cor_geral = self.cfg.get("cor_papel", self.cfg["cor"])
         self.avisou_bandeja = iniciar_escondido
-        root.title("RGB Sync")
-        root.configure(bg=BG)
-        root.resizable(False, False)
-        self._montar_janela()
 
-        self.icon = pystray.Icon("RGBSync", icone_bandeja(self.cfg["cor"]), "RGB Sync",
-                                 self._menu_bandeja())
+        root.title("RGB Sync")
+        root.configure(fg_color=FUNDO)
+        root.resizable(False, False)
+        try:
+            root.iconbitmap(ICO)
+            root.after(300, lambda: root.iconbitmap(ICO))   # o customtkinter troca o ícone
+        except Exception:
+            pass
+        self._montar()
+        root.after(50, self._barra_titulo_escura)
+
+        self.icon = pystray.Icon("RGBSync", self._img_bandeja(), "RGB Sync", self._menu())
         self.icon.run_detached()
 
-        ouvir_outras_copias(lambda: root.after(0, self.mostrar))
+        motor.ouvir_outras_copias(lambda: root.after(0, self.mostrar),
+                                  lambda: root.after(0, self.sair))
         root.protocol("WM_DELETE_WINDOW", self.esconder)
+        root.bind("<Map>", lambda e: self._visivel(True))
+        root.bind("<Unmap>", lambda e: self._visivel(False))
+
+        self.trab = motor.Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d))
+        self.trab.start()
+        self._atualizar_modo()
         if iniciar_escondido:
             root.withdraw()
+        def manutencao():
+            motor.corrigir_tarefa_se_preciso()
+            motor.garantir_atalho_menu_iniciar()
+        threading.Thread(target=manutencao, daemon=True).start()
 
-        self.trab = Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d))
-        self.trab.start()
-        self._atualizar_modo_ui()
+    # ================================================================ montagem
+    def _cartao(self, titulo=None):
+        f = ctk.CTkFrame(self.root, fg_color=CARTAO, corner_radius=14, border_width=1,
+                         border_color=BORDA)
+        f.pack(fill="x", padx=16, pady=(0, 10))
+        if titulo:
+            ctk.CTkLabel(f, text=titulo, text_color=SUAVE, font=("Segoe UI", 12)).pack(
+                anchor="w", padx=16, pady=(10, 0))
+        return f
 
-    # ---- montagem
-    def _botao(self, pai, texto, cmd, **kw):
-        return tk.Button(pai, text=texto, command=cmd, bg=PAINEL, fg=TEXTO,
-                         activebackground="#2a2a33", activeforeground=TEXTO,
-                         relief="flat", padx=10, pady=3, cursor="hand2", **kw)
-
-    def _montar_janela(self):
-        root = self.root
-        tk.Label(root, text="RGB Sync", bg=BG, fg=TEXTO,
-                 font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=18, pady=(16, 2))
-        tk.Label(root, text="Uma cor para o PC inteiro", bg=BG, fg=SUAVE,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=18)
+    def _montar(self):
+        r = self.root
+        # cabeçalho
+        topo = ctk.CTkFrame(r, fg_color="transparent")
+        topo.pack(fill="x", padx=18, pady=(16, 12))
+        try:
+            img = ctk.CTkImage(Image.open(PNG), size=(34, 34))
+            ctk.CTkLabel(topo, image=img, text="").pack(side="left")
+        except Exception:
+            pass
+        ctk.CTkLabel(topo, text="RGB Sync", text_color=TEXTO,
+                     font=("Segoe UI Semibold", 20)).pack(side="left", padx=(10, 0))
+        self.lbl_estado = ctk.CTkLabel(topo, text="●  Conectando…", text_color=ALERTA,
+                                       font=("Segoe UI", 12))
+        self.lbl_estado.pack(side="right")
 
         # modo
-        modo = tk.Frame(root, bg=PAINEL, padx=10, pady=8)
-        modo.pack(fill="x", padx=18, pady=(12, 0))
-        self.var_modo = tk.StringVar(value=self.cfg["modo"])
-        estilo_radio = dict(bg=PAINEL, fg=TEXTO, selectcolor=BG, activebackground=PAINEL,
-                            activeforeground=TEXTO, font=("Segoe UI", 10), cursor="hand2",
-                            command=self.mudar_modo, variable=self.var_modo)
-        tk.Radiobutton(modo, text="Cor fixa", value="fixo", **estilo_radio).grid(
-            row=0, column=0, sticky="w")
-        tk.Radiobutton(modo, text="Seguir papel de parede", value="papel_parede",
-                       **estilo_radio).grid(row=0, column=1, sticky="w", padx=(14, 0))
-        self.MONITORES = {"Os dois monitores": "ambos", "Monitor principal": "principal",
-                          "Monitor secundário": "secundario"}
-        nome_mon = next(k for k, v in self.MONITORES.items() if v == self.cfg["monitor"])
-        self.var_monitor = tk.StringVar(value=nome_mon)
-        self.menu_monitor = tk.OptionMenu(modo, self.var_monitor, *self.MONITORES,
-                                          command=self.mudar_monitor)
-        self.menu_monitor.configure(bg=BG, fg=TEXTO, activebackground="#2a2a33",
-                                    activeforeground=TEXTO, relief="flat",
-                                    highlightthickness=0, font=("Segoe UI", 9))
-        self.menu_monitor["menu"].configure(bg=PAINEL, fg=TEXTO)
-        self.menu_monitor.grid(row=1, column=1, sticky="w", padx=(14, 0), pady=(4, 0))
-        self.lbl_fonte = tk.Label(modo, text="", bg=PAINEL, fg=SUAVE, font=("Segoe UI", 8))
-        self.lbl_fonte.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.seg_modo = ctk.CTkSegmentedButton(
+            r, values=list(MODOS), command=self._mudar_modo, height=38,
+            font=("Segoe UI Semibold", 13), fg_color=CARTAO, unselected_color=CARTAO,
+            unselected_hover_color="#24242c", selected_color=DESTAQUE,
+            selected_hover_color="#6a4cf0", text_color=TEXTO, corner_radius=12)
+        self.seg_modo.set(_nome(MODOS, self.cfg["modo"]))
+        self.seg_modo.pack(fill="x", padx=16, pady=(0, 10))
 
-        topo = tk.Frame(root, bg=BG)
-        topo.pack(fill="x", padx=18, pady=14)
-        self.amostra = tk.Label(topo, width=6, height=3, bg=self.cfg["cor"])
+        # prévia
+        cp = self._cartao("Seus LEDs agora")
+        self.previa = Previa(cp)
+        self.previa.pack(padx=20, pady=(6, 14))
+        self.previa.montar({"corsair": [], "msi": []})
+
+        # opções do modo papel de parede
+        self.c_papel = self._cartao()
+        linha = ctk.CTkFrame(self.c_papel, fg_color="transparent")
+        linha.pack(fill="x", padx=16, pady=(12, 4))
+        ctk.CTkLabel(linha, text="Monitor", text_color=TEXTO, font=("Segoe UI", 13)).pack(
+            side="left")
+        self.seg_monitor = ctk.CTkSegmentedButton(
+            linha, values=list(MONITORES), command=self._mudar_monitor, height=30,
+            font=("Segoe UI", 12), fg_color=FUNDO, unselected_color=FUNDO,
+            unselected_hover_color="#24242c", selected_color="#34343f",
+            selected_hover_color="#3c3c48", text_color=TEXTO)
+        self.seg_monitor.set(_nome(MONITORES, self.cfg["monitor"]))
+        self.seg_monitor.pack(side="right")
+        self.lbl_fonte = ctk.CTkLabel(self.c_papel, text="", text_color=SUAVE,
+                                      font=("Segoe UI", 11), justify="left")
+        self.lbl_fonte.pack(anchor="w", padx=16, pady=(0, 10))
+
+        # opções do modo cor fixa
+        self.c_fixo = self._cartao()
+        grade = ctk.CTkFrame(self.c_fixo, fg_color="transparent")
+        grade.pack(fill="x", padx=14, pady=(14, 8))
+        for i, (nome, cor) in enumerate(PRESETS):
+            b = ctk.CTkButton(grade, text="", width=34, height=34, corner_radius=17,
+                              fg_color=cor, hover_color=cor, border_width=2,
+                              border_color=CARTAO, command=lambda c=cor: self.definir(c))
+            b.grid(row=0, column=i, padx=3)
+        linha2 = ctk.CTkFrame(self.c_fixo, fg_color="transparent")
+        linha2.pack(fill="x", padx=16, pady=(0, 14))
+        self.amostra = ctk.CTkFrame(linha2, width=34, height=34, corner_radius=8,
+                                    fg_color=self.cfg["cor"])
         self.amostra.pack(side="left")
-        lado = tk.Frame(topo, bg=BG)
-        lado.pack(side="left", padx=12)
-        self.lbl_hex = tk.Label(lado, text=self.cfg["cor"].upper(), bg=BG, fg=TEXTO,
-                                font=("Consolas", 13))
-        self.lbl_hex.pack(anchor="w")
-        self._botao(lado, "Escolher cor…", self.escolher).pack(anchor="w", pady=(4, 0))
+        self.ent_hex = ctk.CTkEntry(linha2, width=96, height=32, fg_color=FUNDO,
+                                    border_color=BORDA, text_color=TEXTO,
+                                    font=("Consolas", 13))
+        self.ent_hex.insert(0, self.cfg["cor"].upper())
+        self.ent_hex.bind("<Return>", self._hex_digitado)
+        self.ent_hex.bind("<FocusOut>", self._hex_digitado)
+        self.ent_hex.pack(side="left", padx=10)
+        ctk.CTkButton(linha2, text="Escolher cor…", width=120, height=32, fg_color="#2a2a33",
+                      hover_color="#34343f", text_color=TEXTO, font=("Segoe UI", 12),
+                      command=self.escolher).pack(side="right")
+        ctk.CTkButton(linha2, text="Apagar", width=70, height=32, fg_color="transparent",
+                      border_width=1, border_color=BORDA, hover_color="#24242c",
+                      text_color=SUAVE, font=("Segoe UI", 12),
+                      command=lambda: self.definir("#000000")).pack(side="right", padx=8)
 
-        grade = tk.Frame(root, bg=BG)
-        grade.pack(padx=18)
-        for i, (_, cor) in enumerate(PRESETS):
-            tk.Button(grade, bg=cor, activebackground=cor, width=4, relief="flat",
-                      cursor="hand2", command=lambda c=cor: self.definir(c)).grid(
-                row=0, column=i, padx=2)
-        self._botao(root, "Apagar tudo", lambda: self.definir("#000000")).pack(
-            anchor="w", padx=18, pady=(8, 0))
+        # brilho
+        cb = self._cartao()
+        lb = ctk.CTkFrame(cb, fg_color="transparent")
+        lb.pack(fill="x", padx=16, pady=(12, 12))
+        ctk.CTkLabel(lb, text="Brilho", text_color=TEXTO, font=("Segoe UI", 13)).pack(side="left")
+        self.lbl_brilho = ctk.CTkLabel(lb, text="", width=44, text_color=SUAVE,
+                                       font=("Segoe UI", 12))
+        self.lbl_brilho.pack(side="right")
+        self.sl_brilho = ctk.CTkSlider(lb, from_=0, to=100, number_of_steps=100,
+                                       command=self._mudar_brilho, button_color=DESTAQUE,
+                                       button_hover_color="#8f73ff", progress_color=DESTAQUE,
+                                       fg_color="#2a2a33")
+        self.sl_brilho.set(self.cfg["brilho"])
+        self.sl_brilho.pack(side="right", fill="x", expand=True, padx=(16, 8))
+        self.lbl_brilho.configure(text=f"{int(self.cfg['brilho'])}%")
 
-        tk.Label(root, text="Brilho", bg=BG, fg=SUAVE, font=("Segoe UI", 9)).pack(
-            anchor="w", padx=18, pady=(12, 0))
-        self.brilho = tk.Scale(root, from_=0, to=100, orient="horizontal", length=330,
-                               bg=BG, fg=TEXTO, troughcolor=PAINEL, highlightthickness=0,
-                               command=lambda _v: self.enviar())
-        self.brilho.set(self.cfg.get("brilho", 100))
-        self.brilho.pack(padx=18)
+        # ajustes
+        ca = self._cartao()
+        la = ctk.CTkFrame(ca, fg_color="transparent")
+        la.pack(fill="x", padx=16, pady=(12, 6))
+        self.var_inicio = ctk.BooleanVar(value=motor.inicializacao_ativa())
+        ctk.CTkSwitch(la, text="Iniciar com o Windows", variable=self.var_inicio,
+                      command=self._mudar_inicio, text_color=TEXTO, font=("Segoe UI", 13),
+                      progress_color=DESTAQUE).pack(side="left")
+        ld = ctk.CTkFrame(ca, fg_color="transparent")
+        ld.pack(fill="x", padx=16, pady=(2, 10))
+        self.lbl_disp = ctk.CTkLabel(ld, text="", text_color=SUAVE, font=("Segoe UI", 11),
+                                     justify="left")
+        self.lbl_disp.pack(side="left")
+        ctk.CTkButton(ld, text="Restaurar MSI original", width=10, height=26,
+                      fg_color="transparent", hover_color="#24242c", text_color=SUAVE,
+                      font=("Segoe UI", 11), command=self.restaurar).pack(side="right")
 
-        tk.Label(root, text="Dispositivos", bg=BG, fg=SUAVE, font=("Segoe UI", 9)).pack(
-            anchor="w", padx=18, pady=(10, 2))
-        self.status = tk.Label(root, text="Conectando…", bg=PAINEL, fg=TEXTO, justify="left",
-                               anchor="w", font=("Consolas", 9), padx=10, pady=8, width=48)
-        self.status.pack(padx=18)
+        ctk.CTkLabel(r, text=f"Fechar a janela mantém o RGB Sync na bandeja  ·  v{VERSAO}",
+                     text_color="#5c5c68", font=("Segoe UI", 10)).pack(pady=(0, 12))
 
-        rodape = tk.Frame(root, bg=BG)
-        rodape.pack(fill="x", padx=14, pady=(4, 12))
-        tk.Label(rodape, text="Fechar = continua na bandeja", bg=BG, fg=SUAVE,
-                 font=("Segoe UI", 8)).pack(side="left", padx=4)
-        tk.Button(rodape, text="Restaurar MSI original", command=self.restaurar,
-                  bg=BG, fg=SUAVE, activebackground=BG, activeforeground=TEXTO,
-                  relief="flat", cursor="hand2", font=("Segoe UI", 8)).pack(side="right")
+    def _barra_titulo_escura(self):
+        """Windows 11: barra de título escura e da mesma cor do fundo.
+        Só funciona depois que a janela existe de verdade (foi mostrada ao menos uma
+        vez), por isso é chamada também ao mostrar."""
+        try:
+            from ctypes import wintypes as W
+            u, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+            u.GetParent.restype = W.HWND
+            u.GetParent.argtypes = [W.HWND]
+            dwm.DwmSetWindowAttribute.argtypes = [W.HWND, W.DWORD, ctypes.c_void_p, W.DWORD]
+            hwnd = u.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+            um = ctypes.c_int(1)
+            r1 = dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(um), 4)  # modo escuro
+            r, g, b = hex_rgb(FUNDO)
+            cor = ctypes.c_int(r | (g << 8) | (b << 16))                     # COLORREF
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(cor), 4)      # cor da barra
+            # força o Windows a redesenhar a moldura já (senão só muda ao trocar o foco)
+            u.SetWindowPos.argtypes = [W.HWND, W.HWND, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            u.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            if r1 != 0:
+                log.warning("barra de título escura falhou: hwnd=%s resultado=%s", hwnd, r1)
+        except Exception:
+            log.exception("barra de título")
 
-    def _menu_bandeja(self):
-        def na_ui(func, *args):
+    # ================================================================ bandeja
+    def _img_bandeja(self):
+        return icone(64, hex_rgb(self.cor_geral if self.cfg["modo"] == "papel_parede"
+                                 else self.cfg["cor"]))
+
+    def _menu(self):
+        def ui(func, *args):
             return lambda icon, item: self.root.after(0, func, *args)
 
-        cores = pystray.Menu(*[pystray.MenuItem(nome, na_ui(self.definir, cor))
-                               for nome, cor in PRESETS])
-        def alternar_papel():
-            self.var_modo.set("fixo" if self.cfg["modo"] == "papel_parede" else "papel_parede")
-            self.mudar_modo()
-
+        cores = pystray.Menu(*[pystray.MenuItem(n, ui(self.definir, c)) for n, c in PRESETS])
         return pystray.Menu(
-            pystray.MenuItem("Abrir RGB Sync", na_ui(self.mostrar), default=True),
-            pystray.MenuItem("Seguir papel de parede", na_ui(alternar_papel),
-                             checked=lambda item: self.cfg.get("modo") == "papel_parede"),
-            pystray.MenuItem("Cores", cores),
-            pystray.MenuItem("Apagar tudo", na_ui(self.definir, "#000000")),
+            pystray.MenuItem("Abrir RGB Sync", ui(self.mostrar), default=True),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Sair", na_ui(self.sair)),
+            pystray.MenuItem("Papel de parede", ui(self._mudar_modo, "Papel de parede"),
+                             checked=lambda i: self.cfg["modo"] == "papel_parede", radio=True),
+            pystray.MenuItem("Cor fixa", ui(self._mudar_modo, "Cor fixa"),
+                             checked=lambda i: self.cfg["modo"] == "fixo", radio=True),
+            pystray.MenuItem("Cores", cores),
+            pystray.MenuItem("Apagar tudo", ui(self.definir, "#000000")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Sair", ui(self.sair)),
         )
 
-    # ---- ações
+    # ================================================================ ações
+    def _mudar_modo(self, nome):
+        self.cfg["modo"] = MODOS[nome]
+        self.seg_modo.set(nome)
+        self._atualizar_modo()
+        self.enviar()
+        self.icon.update_menu()
+
+    def _atualizar_modo(self):
+        papel = self.cfg["modo"] == "papel_parede"
+        self.c_papel.pack_forget()
+        self.c_fixo.pack_forget()
+        alvo = self.c_papel if papel else self.c_fixo
+        alvo.pack(fill="x", padx=16, pady=(0, 10), after=self.previa.master)
+        if papel:
+            self.lbl_fonte.configure(text="Lendo o papel de parede…")
+            self.previa.zonas_msi(self.cor_geral)
+        else:
+            self.previa.tudo(self._hex_com_brilho(self.cfg["cor"]))
+        if hasattr(self, "icon"):
+            self.icon.icon = self._img_bandeja()
+
+    def _mudar_monitor(self, nome):
+        self.cfg["monitor"] = MONITORES[nome]
+        self.enviar()
+
+    def _mudar_brilho(self, valor):
+        self.cfg["brilho"] = int(valor)
+        self.lbl_brilho.configure(text=f"{int(valor)}%")
+        self.enviar()
+
+    def _hex_com_brilho(self, hexa):
+        k = self.cfg["brilho"] / 100
+        return rgb_hex(round(c * k) for c in hex_rgb(hexa))
+
+    def definir(self, hexa):
+        """Cor escolhida à mão → modo cor fixa."""
+        self.cfg["cor"] = hexa
+        self.amostra.configure(fg_color=hexa)
+        self.ent_hex.delete(0, "end")
+        self.ent_hex.insert(0, hexa.upper())
+        if self.cfg["modo"] != "fixo":
+            self._mudar_modo("Cor fixa")
+        else:
+            self._atualizar_modo()
+            self.enviar()
+
+    def _hex_digitado(self, _e=None):
+        t = self.ent_hex.get().strip().lstrip("#")
+        if len(t) == 6 and all(c in "0123456789abcdefABCDEF" for c in t):
+            if "#" + t.lower() != self.cfg["cor"].lower():
+                self.definir("#" + t.lower())
+        else:
+            self.ent_hex.delete(0, "end")
+            self.ent_hex.insert(0, self.cfg["cor"].upper())
+
     def escolher(self):
         _, hexa = colorchooser.askcolor(color=self.cfg["cor"], title="Escolha a cor")
         if hexa:
             self.definir(hexa)
 
-    def definir(self, hexa):
-        """Cor escolhida à mão (preset, seletor, apagar) → volta pro modo cor fixa."""
-        self.cfg["cor"] = hexa
-        if self.cfg["modo"] != "fixo":
-            self.cfg["modo"] = "fixo"
-            self.var_modo.set("fixo")
-            self._atualizar_modo_ui()
-        self._mostrar_cor(hexa)
-        self.enviar()
-
-    def _mostrar_cor(self, hexa):
-        self.cor_atual = hexa
-        self.amostra.configure(bg=hexa)
-        self.lbl_hex.configure(text=hexa.upper())
-        self.icon.icon = icone_bandeja(hexa)
-
-    def _com_brilho(self, hexa):
-        h = hexa.lstrip("#")
-        k = self.brilho.get() / 100
-        return tuple(round(int(h[i:i + 2], 16) * k) for i in (0, 2, 4))
-
     def enviar(self):
-        """Manda o estado atual pro trabalhador (cor fixa ou papel de parede)."""
-        self.cfg["brilho"] = self.brilho.get()
         salvar_config(self.cfg)
         if not self.pronto:
             return
         if self.cfg["modo"] == "papel_parede":
-            if self.trab.papel and self.trab.papel["monitor"] == self.cfg["monitor"]:
+            p = self.trab.papel
+            if p and p["monitor"] == self.cfg["monitor"]:
                 self.trab.ajustar_brilho(self.cfg["brilho"])
             else:
                 self.trab.ativar_papel(self.cfg["monitor"], self.cfg["brilho"])
+            self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
         else:
-            self.trab.papel = None
-            self.trab.fila.put(("cor", self._com_brilho(self.cor_atual)))
+            self.trab.cor_fixa(hex_rgb(self._hex_com_brilho(self.cfg["cor"])))
+            self.previa.tudo(self._hex_com_brilho(self.cfg["cor"]))
 
-    # ---- papel de parede
-    def mudar_modo(self):
-        self.cfg["modo"] = self.var_modo.get()
-        self._atualizar_modo_ui()
-        if self.cfg["modo"] == "fixo":
-            self._mostrar_cor(self.cfg["cor"])
-        else:
-            self.lbl_fonte.configure(text="lendo papel de parede…")
-        self.enviar()
-        self.icon.update_menu()
-
-    def mudar_monitor(self, nome):
-        self.cfg["monitor"] = self.MONITORES[nome]
-        self.enviar()
-
-    def _atualizar_modo_ui(self):
-        papel = self.cfg["modo"] == "papel_parede"
-        self.menu_monitor.configure(state="normal" if papel else "disabled")
-        if not papel:
-            self.lbl_fonte.configure(text="")
-
-    def cor_do_papel(self, rgb, fonte):
-        """Só visual: a cor geral (a que vai pra MSI) aparece na amostra/bandeja."""
-        if self.cfg["modo"] != "papel_parede":
-            return
-        hexa = "#%02x%02x%02x" % rgb
-        self._mostrar_cor(hexa)
-        self.cfg["cor_papel"] = hexa
-        salvar_config(self.cfg)
-        self.lbl_fonte.configure(text=f"ao vivo · {fonte}")
-
-    def info_papel(self, texto):
-        self.lbl_fonte.configure(text=texto)
-
-    def _texto_status_papel(self):
-        linhas = [f"… {m}: {s}" for m, s in self.conexao.items() if s != "ok"]
-        if self.conexao.get("Corsair (iCUE)") == "ok":
-            linhas.append("✓ Corsair: cada LED com sua cor (ao vivo)")
-        if self.conexao.get("MSI (Mystic Light)") == "ok":
-            linhas.append("✓ MSI: cor geral do papel de parede")
-        linhas.append("– HyperX: ainda não suportado")
-        return "\n".join(linhas)
+    def _mudar_inicio(self):
+        querer = self.var_inicio.get()
+        ok = motor.ativar_inicializacao() if querer else motor.desativar_inicializacao()
+        if not ok:
+            self.var_inicio.set(not querer)
+        self.var_inicio.set(motor.inicializacao_ativa())
 
     def restaurar(self):
         self.trab.fila.put(("restaurar", None))
+
+    # ================================================================ janela
+    def _visivel(self, sim):
+        if sim and not getattr(self, "_titulo_agendado", False):
+            # o customtkinter mexe na moldura ao reexibir; aplica depois dele
+            self._titulo_agendado = True
+
+            def aplicar():
+                self._titulo_agendado = False
+                self._barra_titulo_escura()
+            self.root.after(150, aplicar)
+        if hasattr(self, "trab"):
+            self.trab.ligar_preview(sim and self.root.state() != "withdrawn")
 
     def mostrar(self):
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        self._visivel(True)
 
     def esconder(self):
         self.root.withdraw()
+        self._visivel(False)
         if not self.avisou_bandeja:
             self.avisou_bandeja = True
             try:
@@ -502,67 +472,77 @@ class App:
         self.icon.stop()
         self.root.destroy()
 
-    # ---- status
+    # ================================================================ mensagens do motor
     def ao_status(self, tipo, dados):
         if tipo == "conexao":
             self.conexao = dados
             self.pronto = True
-            self.enviar()   # (re)aplica a última cor salva
-        elif tipo == "resultado":
-            linhas = [f"… {m}: {s}" for m, s in self.conexao.items() if s != "ok"]
-            for disp, st in dados.items():
-                ok = st in ("CE_Success", "OK")
-                linhas.append(f"{'✓' if ok else '✗'} {disp}" + ("" if ok else f"  ({st})"))
-            linhas.append("– HyperX: ainda não suportado")
-            self.status.configure(text="\n".join(linhas))
-        elif tipo == "restaurar":
-            self.status.configure(text=f"MSI: {dados}\n(Corsair segue a cor do app)")
+            ok = [m for m, s in dados.items() if s == "ok"]
+            if len(ok) == len(dados):
+                self.lbl_estado.configure(text="●  Conectado", text_color=OK)
+            else:
+                self.lbl_estado.configure(text="●  Conectando…", text_color=ALERTA)
+            linhas = []
+            for marca, st in dados.items():
+                linhas.append(f"{'✓' if st == 'ok' else '…'}  {marca.split(' (')[0]}"
+                              + ("" if st == "ok" else f" — {st}"))
+            linhas.append("–  Teclado HyperX (em breve)")
+            self.lbl_disp.configure(text="\n".join(linhas))
+            self.enviar()
+        elif tipo == "layouts":
+            self.previa.montar(dados)
+            self._atualizar_modo()
+            self._visivel(self.root.state() != "withdrawn")
+        elif tipo == "preview":
+            if self.cfg["modo"] == "papel_parede":
+                self.previa.leds(dados)
         elif tipo == "papel_cor":
-            self.cor_do_papel(*dados)
-            self.status.configure(text=self._texto_status_papel())
+            geral, fonte = dados
+            self.cor_geral = rgb_hex(geral)
+            self.cfg["cor_papel"] = self.cor_geral
+            salvar_config(self.cfg)
+            if self.cfg["modo"] == "papel_parede":
+                self.previa.zonas_msi(self._hex_com_brilho(self.cor_geral))
+                self.lbl_fonte.configure(text=f"Ao vivo  ·  {fonte}")
+                self.icon.icon = self._img_bandeja()
         elif tipo == "papel_info":
-            self.info_papel(dados)
+            self.lbl_fonte.configure(text=dados)
+        elif tipo == "restaurar":
+            self.lbl_fonte.configure(text=f"MSI: {dados}")
+        elif tipo == "resultado":
+            ruins = [d for d, s in dados.items() if s not in ("CE_Success", "OK")]
+            if ruins:
+                log.warning("falha ao aplicar em %s", ruins)
 
 
-TAREFA = "RGB Sync"
-
-
-def abrir_pelo_atalho():
-    """Usado pelo 'Abrir RGB.bat' (roda SEM admin).
-
-    - Se o app já está rodando: só mostra a janela.
-    - Se a inicialização com o Windows está instalada: dispara a tarefa agendada
-      (já tem admin, então NÃO aparece o aviso do Windows) e mostra a janela.
-    - Senão: abre pedindo administrador.
-    """
-    import ctypes
-    import subprocess
-    import time
-    if ja_esta_rodando():
+def main():
+    if "--abrir" in sys.argv:          # compatibilidade com o atalho antigo
+        sys.argv.remove("--abrir")
+    if "--sair" in sys.argv:           # fecha a cópia que está rodando (instalador)
+        motor.pedir_para_sair()
         return
-    sem_janela = subprocess.CREATE_NO_WINDOW
-    tem_tarefa = subprocess.run(["schtasks", "/query", "/tn", TAREFA],
-                                capture_output=True, creationflags=sem_janela).returncode == 0
-    if tem_tarefa:
-        subprocess.run(["schtasks", "/run", "/tn", TAREFA],
-                       capture_output=True, creationflags=sem_janela)
-        for _ in range(40):            # até 20 s esperando ela subir
-            time.sleep(0.5)
-            if ja_esta_rodando():
-                return
-    else:
-        pythonw = os.path.join(PASTA, ".venv", "Scripts", "pythonw.exe")
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", pythonw, f'"{os.path.join(PASTA, "app.py")}"', PASTA, 1)
+    if motor.ja_esta_rodando():
+        return
+    if not motor.e_admin():
+        # Não pede administrador se a inicialização com o Windows está ligada:
+        # a tarefa agendada já tem a permissão.
+        if motor.inicializacao_ativa() and motor.abrir_pela_tarefa():
+            motor.ja_esta_rodando()        # pede pra mostrar a janela
+            return
+        motor.abrir_elevado()
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RGBSync.App")
+    except Exception:
+        pass
+    from rgb_core import DADOS
+    log.info("=== app iniciado v%s %s | dados=%s | APPDATA=%s | exe=%s", VERSAO, sys.argv[1:],
+             DADOS, os.environ.get("APPDATA"), sys.executable)
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
+    App(root, iniciar_escondido="--bandeja" in sys.argv)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    if "--abrir" in sys.argv:
-        abrir_pelo_atalho()
-        sys.exit(0)
-    if ja_esta_rodando():
-        sys.exit(0)
-    log.info("=== app iniciado %s", sys.argv[1:])
-    root = tk.Tk()
-    App(root, iniciar_escondido="--bandeja" in sys.argv)
-    root.mainloop()
+    main()

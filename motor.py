@@ -1,0 +1,446 @@
+"""
+Motor do RGB Sync (sem interface):
+
+- configuração do usuário (%APPDATA%\\RGB Sync\\config.json);
+- instância única (a 2ª cópia só pede pra 1ª mostrar a janela);
+- inicialização com o Windows (tarefa agendada elevada);
+- Trabalhador: a thread que fala com os SDKs e roda o modo papel de parede ao vivo.
+"""
+
+import ctypes
+import json
+import os
+import queue
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+from PIL import ImageChops, ImageStat
+
+from papel_parede import Capturador, cor_para_leds, cores_por_led, preparar_layout
+from rgb_core import DADOS, Controlador, _pasta_appdata, log
+
+CONFIG = os.path.join(DADOS, "config.json")
+PORTA_UNICA = 47652          # só para a 2ª cópia avisar a 1ª: "mostre a janela"
+RETENTATIVAS = 18            # 18 x 10 s = 3 min tentando conectar no boot
+TAREFA = "RGB Sync"
+SEM_JANELA = subprocess.CREATE_NO_WINDOW
+
+PADRAO = {"modo": "papel_parede", "monitor": "principal", "cor": "#0050ff", "brilho": 100}
+
+
+# ============================================================= configuração
+def ler_config():
+    cfg = dict(PADRAO)
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def salvar_config(cfg):
+    try:
+        with open(CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        log.exception("falha ao salvar config")
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_hex(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+# ============================================================= instância única
+def ja_esta_rodando():
+    """Se já existe uma cópia, pede pra ela mostrar a janela e devolve True."""
+    try:
+        with socket.create_connection(("127.0.0.1", PORTA_UNICA), timeout=1) as s:
+            s.sendall(b"mostrar")
+        return True
+    except OSError:
+        return False
+
+
+def pedir_para_sair():
+    """Fecha a cópia que está rodando (usado ao instalar uma versão nova)."""
+    try:
+        with socket.create_connection(("127.0.0.1", PORTA_UNICA), timeout=1) as s:
+            s.sendall(b"sair")
+        return True
+    except OSError:
+        return False
+
+
+def ouvir_outras_copias(ao_mostrar, ao_sair=None):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", PORTA_UNICA))
+    srv.listen(1)
+
+    def loop():
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                msg = conn.recv(16)
+                if msg == b"mostrar":
+                    ao_mostrar()
+                elif msg == b"sair" and ao_sair:
+                    ao_sair()
+                elif msg == b"diag":                     # diagnóstico local
+                    import logging
+                    info = {"pid": os.getpid(), "exe": sys.executable, "dados": CONFIG,
+                            "admin": e_admin(), "APPDATA": os.environ.get("APPDATA"),
+                            "cwd": os.getcwd(),
+                            "handlers": [repr(h) for h in logging.getLogger().handlers],
+                            "nivel": log.getEffectiveLevel(),
+                            "desligado": logging.root.manager.disable}
+                    try:
+                        info["arquivos"] = sorted(os.listdir(DADOS))
+                        info["atalho"] = os.path.exists(caminho_atalho())
+                        with open(os.path.join(DADOS, "rgb.log"), encoding="utf-8",
+                                  errors="replace") as f:
+                            info["log"] = [l.rstrip() for l in f.readlines()[-25:]
+                                           if "estilos=" not in l]
+                        info["config"] = ler_config()
+                    except Exception as e:
+                        info["erro_info"] = repr(e)
+                    try:
+                        h = logging.getLogger().handlers[0]
+                        info["stream"] = repr(h.stream)
+                        info["pos"] = h.stream.tell() if h.stream else None
+                        info["ino_aberto"] = os.fstat(h.stream.fileno()).st_ino
+                        info["ino_caminho"] = os.stat(h.baseFilename).st_ino
+                        info["tam_caminho"] = os.path.getsize(h.baseFilename)
+                    except Exception as e:
+                        info["erro_stream"] = repr(e)
+                    conn.sendall(json.dumps(info, ensure_ascii=False).encode("utf-8"))
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def e_admin():
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+# ============================================================= como se iniciar
+def comando_do_app():
+    """(executável, argumentos, pasta) para abrir ESTA instalação do app."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, "", os.path.dirname(sys.executable)
+    script = os.path.abspath(sys.argv[0])
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        exe = exe[:-len("python.exe")] + "pythonw.exe"
+    return exe, f'"{script}"', os.path.dirname(script)
+
+
+def abrir_elevado(args_extra=""):
+    exe, args, pasta = comando_do_app()
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, f"{args} {args_extra}".strip(),
+                                        pasta, 1)
+
+
+def caminho_atalho():
+    return os.path.join(_pasta_appdata(), r"Microsoft\Windows\Start Menu\Programs\RGB Sync.lnk")
+
+
+def garantir_atalho_menu_iniciar():
+    """Cria/atualiza o atalho do Menu Iniciar apontando para este .exe (só na versão
+    executável). Feito pelo próprio app para cair no Menu Iniciar real do usuário."""
+    if not getattr(sys, "frozen", False):
+        return
+    exe = sys.executable
+    lnk = caminho_atalho()
+    ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+          f"if ($s.TargetPath -ne '{exe}') {{ $s.TargetPath='{exe}';"
+          f"$s.WorkingDirectory='{os.path.dirname(exe)}'; $s.IconLocation='{exe},0';"
+          f"$s.Description='RGB Sync'; $s.Save(); 'criado' }}")
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+                       text=True, creationflags=SEM_JANELA)
+    if r.stdout.strip():
+        log.info("atalho do Menu Iniciar: %s", r.stdout.strip())
+
+
+# ============================================================= iniciar com o Windows
+def _schtasks(*args):
+    return subprocess.run(["schtasks", *args], capture_output=True, text=True,
+                          creationflags=SEM_JANELA)
+
+
+def inicializacao_ativa():
+    return _schtasks("/query", "/tn", TAREFA).returncode == 0
+
+
+def comando_da_tarefa():
+    """Caminho do executável que a tarefa agendada abre (ou None)."""
+    r = _schtasks("/query", "/tn", TAREFA, "/xml")
+    if r.returncode != 0:
+        return None
+    m = re.search(r"<Command>(.*?)</Command>", r.stdout)
+    return m.group(1).strip().strip('"') if m else None
+
+
+def ativar_inicializacao():
+    """Cria/atualiza a tarefa "RGB Sync": roda no login, elevada, escondida na
+    bandeja, 20 s depois do login (dá tempo do iCUE e do MSI Center subirem).
+    Precisa de administrador (o app já roda assim)."""
+    exe, args, pasta = comando_do_app()
+    args = f"{args} --bandeja".strip().replace("'", "''")
+    usuario = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
+    ps = f"""
+$a = New-ScheduledTaskAction -Execute '{exe}' -Argument '{args}' -WorkingDirectory '{pasta}'
+$t = New-ScheduledTaskTrigger -AtLogOn -User '{usuario}'
+$t.Delay = 'PT20S'
+$p = New-ScheduledTaskPrincipal -UserId '{usuario}' -LogonType Interactive -RunLevel Highest
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName '{TAREFA}' -Action $a -Trigger $t -Principal $p -Settings $s -Description 'RGB Sync: Corsair + MSI sincronizados' -Force | Out-Null
+"""
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       capture_output=True, text=True, creationflags=SEM_JANELA)
+    ok = r.returncode == 0 and inicializacao_ativa()
+    log.info("ativar inicialização (%s %s): %s %s", exe, args, ok, r.stderr.strip()[:300])
+    return ok
+
+
+def desativar_inicializacao():
+    ok = _schtasks("/delete", "/tn", TAREFA, "/f").returncode == 0
+    log.info("desativar inicialização: %s", ok)
+    return ok
+
+
+def corrigir_tarefa_se_preciso():
+    """Se a inicialização está ligada mas aponta para outra cópia do app (ex.: a
+    versão antiga em Python), aponta para esta."""
+    if not (e_admin() and inicializacao_ativa()):
+        return
+    atual = comando_da_tarefa()
+    exe = comando_do_app()[0]
+    if atual and os.path.normcase(atual) != os.path.normcase(exe):
+        log.info("tarefa apontava para %s; atualizando para %s", atual, exe)
+        ativar_inicializacao()
+
+
+def abrir_pela_tarefa(espera=20):
+    """Sem admin: dispara a tarefa (já elevada, sem aviso do Windows) e espera subir."""
+    if _schtasks("/run", "/tn", TAREFA).returncode != 0:
+        return False
+    for _ in range(int(espera * 2)):
+        time.sleep(0.5)
+        if ja_esta_rodando():
+            return True
+    return False
+
+
+# ============================================================= Trabalhador
+class Trabalhador(threading.Thread):
+    """Todas as chamadas aos SDKs acontecem aqui, numa thread só.
+
+    Modo papel de parede (self.papel != None), até 12 vezes por segundo:
+      - captura o papel de parede (já reduzido, ~5 ms);
+      - Corsair: cada LED recebe a cor da região do papel de parede que corresponde
+        à posição física dele (RAM em coluna, fans em sequência...);
+      - MSI (1 cor por zona, lenta): cor geral a cada 2 s, só quando muda de verdade;
+      - imagem parada (papel estático, jogo em tela cheia): confere só 4x/s e não
+        reenvia nada.
+    Mensagens para a interface (ao_status): conexao, resultado, restaurar, layouts,
+    preview, papel_cor, papel_info.
+    """
+
+    FPS = 12
+    FPS_PARADO = 4
+    LIMIAR_IMAGEM = 0.6       # diferença média mínima (0..255) para considerar que mudou
+    SUAVIDADE = 0.35          # 0..1: quanto cada quadro novo pesa (menos = mais suave)
+    GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
+    LIMIAR_GERAL = 20
+    PREVIEW_A_CADA = 0.2      # s, prévia dos LEDs na janela (só com a janela aberta)
+
+    def __init__(self, ao_status):
+        super().__init__(daemon=True)
+        self.fila = queue.Queue()
+        self.ao_status = ao_status
+        self.ctrl = Controlador()
+        self.papel = None             # {"monitor": ..., "brilho": 0..100} ou None
+        self.preview_ligado = False   # a interface liga quando a janela está visível
+        self._layouts = {}
+        self._layouts_de = None
+        self._suave = {}
+        self._geral_t = 0.0
+        self._geral_enviada = None
+        self._erro_t = 0.0
+        self._cap = None
+        self._img_anterior = None
+        self._estavel = False
+        self._enviado = {}
+        self._parado = 0
+        self._primeiro = False
+        self._forcar_envio = True
+        self._preview_t = 0.0
+
+    # ---- comandos vindos da interface (thread da interface)
+    def ativar_papel(self, monitor, brilho):
+        self.papel = {"monitor": monitor, "brilho": brilho}
+        self._geral_t = 0.0
+        self._geral_enviada = None
+        self._primeiro = True
+        self._forcar_envio = True
+        self._parado = 0
+        self.fila.put(("acordar", None))  # sai da espera longa e começa já
+
+    def ajustar_brilho(self, brilho):
+        if self.papel:
+            self.papel = {**self.papel, "brilho": brilho}
+            self._geral_enviada = None
+            self._forcar_envio = True
+            self._parado = 0
+
+    def ligar_preview(self, ligado):
+        self.preview_ligado = ligado
+        if ligado:                         # manda um quadro completo pra janela já
+            self._forcar_envio = True
+            self._parado = 0
+
+    def cor_fixa(self, rgb):
+        self.papel = None
+        self.fila.put(("cor", rgb))
+
+    # ---- laço principal
+    def run(self):
+        status = self.ctrl.conectar()
+        self._anunciar_layouts()
+        self.ao_status("conexao", status)
+        tentativas, ultima_tentativa = 0, time.monotonic()
+        while True:
+            if not self.papel:
+                espera = 10
+            elif self._parado >= self.FPS:
+                espera = 1 / self.FPS_PARADO
+            else:
+                espera = 1 / self.FPS
+            try:
+                cmd, arg = self.fila.get(timeout=espera)
+            except queue.Empty:
+                if self.papel:
+                    self._parado = self._parado + 1 if self._quadro() else 0
+                # No boot o iCUE pode subir depois do app: tenta de novo a cada 10 s.
+                if (any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS
+                        and time.monotonic() - ultima_tentativa > 10):
+                    tentativas += 1
+                    ultima_tentativa = time.monotonic()
+                    status = self.ctrl.conectar()
+                    log.info("reconexão %d: %s", tentativas, status)
+                    self._anunciar_layouts()
+                    self.ao_status("conexao", status)
+                continue
+            if cmd == "sair":
+                self.ctrl.desconectar()
+                return
+            # Vários pedidos de cor seguidos (arrastando o brilho): só o último vale.
+            while cmd == "cor" and not self.fila.empty() and self.fila.queue[0][0] == "cor":
+                cmd, arg = self.fila.get()
+            if cmd == "cor":
+                self.ao_status("resultado", self.ctrl.aplicar(*arg))
+            elif cmd == "restaurar":
+                self.ao_status("restaurar", self.ctrl.restaurar_msi())
+
+    def _anunciar_layouts(self):
+        """Manda pra interface o desenho de cada dispositivo (para a prévia)."""
+        cors = self.ctrl.corsair()
+        lista = []
+        if cors:
+            for dev_id, (modelo, pos) in cors.posicoes.items():
+                if pos:
+                    ncol, nlin, leds = preparar_layout(pos)
+                    lista.append((dev_id, modelo, ncol, nlin, leds))
+        msi = [nome for b in self.ctrl.ativos if b.__class__.__name__ == "MSI"
+               for nome in ("Placa-mãe", "Placa de vídeo")]
+        self.ao_status("layouts", {"corsair": lista, "msi": msi})
+
+    # ---- modo papel de parede
+    def _quadro(self):
+        """Um quadro do modo ao vivo. Devolve True se a imagem estava parada."""
+        cfg = self.papel
+        if not cfg:
+            return True
+        try:
+            if self._cap is None:
+                self._cap = Capturador()
+            peq, fonte = self._cap.capturar(cfg["monitor"])
+            if peq is None:
+                if time.monotonic() - self._geral_t > self.GERAL_A_CADA:
+                    self._geral_t = time.monotonic()
+                    self.ao_status("papel_info", fonte)
+                return True
+
+            ant = self._img_anterior
+            self._img_anterior = peq
+            mudou = (ant is None or max(ImageStat.Stat(ImageChops.difference(ant, peq)).mean)
+                     > self.LIMIAR_IMAGEM)
+            if not mudou and self._estavel and not self._forcar_envio:
+                return True
+
+            k = cfg["brilho"] / 100
+            cors = self.ctrl.corsair()
+            if cors:
+                if self._layouts_de is not cors.posicoes:
+                    self._layouts = {d: preparar_layout(pos)
+                                     for d, (_, pos) in cors.posicoes.items() if pos}
+                    self._layouts_de = cors.posicoes
+                    self._suave, self._enviado = {}, {}
+                a = self.SUAVIDADE
+                estavel = True
+                mapa = {}
+                for dev_id, lay in self._layouts.items():
+                    leds, mudou_disp = [], False
+                    for led_id, alvo in cores_por_led(peq, lay):
+                        chave = (dev_id, led_id)
+                        ant_c = self._suave.get(chave)
+                        cor = alvo if ant_c is None else tuple(
+                            p + (c - p) * a for p, c in zip(ant_c, alvo))
+                        if max(abs(c - t) for c, t in zip(cor, alvo)) > 1:
+                            estavel = False
+                        self._suave[chave] = cor
+                        final = tuple(round(c * k) for c in cor)
+                        if self._enviado.get(chave) != final:
+                            mudou_disp = True
+                            self._enviado[chave] = final
+                        leds.append((led_id, final))
+                    if mudou_disp or self._forcar_envio:
+                        mapa[dev_id] = leds
+                if mapa:
+                    cors.aplicar_por_led(mapa)
+                self._estavel = estavel
+                if self._primeiro:
+                    self._primeiro = False
+                    log.info("papel de parede ao vivo: %s, %s",
+                             fonte, {d: f"{l[0]}x{l[1]}" for d, l in self._layouts.items()})
+                agora = time.monotonic()
+                if self.preview_ligado and (mapa or self._forcar_envio) \
+                        and agora - self._preview_t >= self.PREVIEW_A_CADA:
+                    self._preview_t = agora
+                    self.ao_status("preview", {(d, i): c for (d, i), c in self._enviado.items()})
+            self._forcar_envio = False
+
+            agora = time.monotonic()
+            if agora - self._geral_t >= self.GERAL_A_CADA:
+                self._geral_t = agora
+                geral = cor_para_leds(peq)
+                env = self._geral_enviada
+                if env is None or max(abs(x - y) for x, y in zip(geral, env)) > self.LIMIAR_GERAL:
+                    self._geral_enviada = geral
+                    self.ctrl.aplicar(*(round(c * k) for c in geral), so_msi=True)
+                    self.ao_status("papel_cor", (geral, fonte))
+            return not mudou
+        except Exception:
+            if time.monotonic() - self._erro_t > 30:     # não lotar o log
+                self._erro_t = time.monotonic()
+                log.exception("falha no quadro do papel de parede")
+            return False

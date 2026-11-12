@@ -17,14 +17,46 @@ import ctypes
 import json
 import logging
 import os
+import shutil
+import sys
 import threading
 from ctypes import POINTER, byref, c_long, c_ulong, c_void_p, c_wchar_p
-
-PASTA = os.path.dirname(os.path.abspath(__file__))
-BACKUP_MSI = os.path.join(PASTA, "msi_backup.json")
-LOG = os.path.join(PASTA, "rgb.log")
-
 from logging.handlers import RotatingFileHandler
+
+# Código/recursos: pasta do script, ou a pasta interna do executável (PyInstaller).
+PASTA = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+# Dados do usuário (config, backup da MSI, log): sempre em %APPDATA%\RGB Sync,
+# assim o executável pode ficar em qualquer lugar e atualizar sem perder nada.
+def _pasta_appdata():
+    """%APPDATA% pela API do Windows (não depende de variável de ambiente, que pode
+    faltar quando o app é aberto pela tarefa agendada)."""
+    try:
+        import uuid
+        guid = uuid.UUID("{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}")   # FOLDERID_RoamingAppData
+        buf = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref((ctypes.c_byte * 16).from_buffer_copy(guid.bytes_le)), 0, None,
+                ctypes.byref(buf)) == 0:
+            caminho = buf.value
+            ctypes.windll.ole32.CoTaskMemFree(buf)
+            return caminho
+    except Exception:
+        pass
+    return os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+
+
+DADOS = os.path.join(_pasta_appdata(), "RGB Sync")
+os.makedirs(DADOS, exist_ok=True)
+# Migração única dos arquivos que antes ficavam junto do código.
+_ANTIGA = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False)
+                                          else __file__))
+for _nome in ("config.json", "msi_backup.json"):
+    _de, _para = os.path.join(_ANTIGA, _nome), os.path.join(DADOS, _nome)
+    if os.path.exists(_de) and not os.path.exists(_para):
+        shutil.copy2(_de, _para)
+
+BACKUP_MSI = os.path.join(DADOS, "msi_backup.json")
+LOG = os.path.join(DADOS, "rgb.log")
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",

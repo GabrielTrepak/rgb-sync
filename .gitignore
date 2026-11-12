@@ -9,3 +9,8 @@ rgb.log
 instalacao.log
 diagnostico_rgb.txt
 diagnostico_rgb.json
+
+# build do executável
+build/
+dist/
+

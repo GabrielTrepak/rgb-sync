@@ -13,6 +13,7 @@ Uso de teste:  python papel_parede.py [saida.png]
 import colorsys
 import ctypes
 import os
+import time
 from ctypes import wintypes as W
 
 from PIL import Image
@@ -34,6 +35,12 @@ g32.DeleteObject.argtypes = [W.HGDIOBJ]
 g32.DeleteDC.argtypes = [W.HDC]
 g32.GetDIBits.argtypes = [W.HDC, W.HBITMAP, W.UINT, W.UINT, ctypes.c_void_p,
                           ctypes.c_void_p, W.UINT]
+g32.SetStretchBltMode.argtypes = [W.HDC, ctypes.c_int]
+g32.SetBrushOrgEx.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+g32.StretchBlt.argtypes = ([W.HDC] + [ctypes.c_int] * 4 + [W.HDC] + [ctypes.c_int] * 4
+                           + [W.DWORD])
+u32.IsWindow.argtypes = [W.HWND]
+HALFTONE, SRCCOPY = 4, 0x00CC0020
 
 EnumProc = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 MonitorProc = ctypes.WINFUNCTYPE(W.BOOL, W.HMONITOR, W.HDC, ctypes.POINTER(W.RECT), W.LPARAM)
@@ -166,6 +173,121 @@ def capturar(qual="ambos"):
     finally:
         if antigo:
             u32.SetThreadDpiAwarenessContext(antigo)
+
+
+# ------------------------------------------------------------- captura rápida (modo ao vivo)
+class Capturador:
+    """Versão otimizada de capturar() para rodar várias vezes por segundo.
+
+    - Reaproveita os buffers do Windows entre quadros (nada é criado a cada quadro).
+    - Reduz a imagem DENTRO do Windows (StretchBlt com média, modo HALFTONE) antes
+      de passar para o Python: em vez de copiar 3840×1080 (16 MB) por quadro, copia
+      192×108 (80 KB). ~20 ms → ~5 ms por quadro.
+    - Procura a janela do Wallpaper Engine de novo a cada 2 s (ela muda quando o
+      papel de parede troca entre vídeo e cena) e os monitores a cada 10 s.
+    Deve ser usado sempre pela mesma thread.
+    """
+
+    LARGURA, ALTURA = 192, 108
+
+    def __init__(self):
+        self.hwnd = None
+        self.hwnd_t = 0.0
+        self.mons = None
+        self.mons_t = 0.0
+        self.grande = None        # (hdc_janela_hwnd, mem, bmp, w, h)
+        mem = g32.CreateCompatibleDC(None)
+        self.mem_p = mem
+        self.bmp_p = None
+        self.buf = ctypes.create_string_buffer(self.LARGURA * self.ALTURA * 4)
+        self.bmi = _BMI(ctypes.sizeof(_BMI), self.LARGURA, -self.ALTURA, 1, 32, 0, 0, 0, 0, 0, 0)
+        self.windows_cache = (None, None)   # (mtime, imagem pequena)
+
+    def _liberar_grande(self):
+        if self.grande:
+            _, mem, bmp, _, _ = self.grande
+            g32.DeleteObject(bmp)
+            g32.DeleteDC(mem)
+            self.grande = None
+
+    def _buffers(self, hwnd, w, h):
+        if self.grande and self.grande[0] == hwnd and self.grande[3:] == (w, h):
+            return self.grande[1]
+        self._liberar_grande()
+        hdc = u32.GetDC(hwnd)
+        mem = g32.CreateCompatibleDC(hdc)
+        bmp = g32.CreateCompatibleBitmap(hdc, w, h)
+        g32.SelectObject(mem, bmp)
+        if self.bmp_p is None:
+            self.bmp_p = g32.CreateCompatibleBitmap(hdc, self.LARGURA, self.ALTURA)
+            g32.SelectObject(self.mem_p, self.bmp_p)
+            g32.SetStretchBltMode(self.mem_p, HALFTONE)
+            g32.SetBrushOrgEx(self.mem_p, 0, 0, None)
+        u32.ReleaseDC(hwnd, hdc)
+        self.grande = (hwnd, mem, bmp, w, h)
+        return mem
+
+    def _regiao(self, hwnd, w, h, qual):
+        """Retângulo (x, y, w, h) dentro da janela para o monitor escolhido."""
+        if qual == "ambos":
+            return 0, 0, w, h
+        agora = time.monotonic()
+        if self.mons is None or agora - self.mons_t > 10:
+            self.mons, self.mons_t = monitores(), agora
+        alvo = next((m for m, prim in self.mons if prim == (qual == "principal")), None)
+        if not alvo:
+            return 0, 0, w, h
+        wr = W.RECT()
+        u32.GetWindowRect(hwnd, ctypes.byref(wr))
+        x0, y0 = max(0, alvo[0] - wr.left), max(0, alvo[1] - wr.top)
+        x1, y1 = min(w, alvo[2] - wr.left), min(h, alvo[3] - wr.top)
+        if x1 - x0 < 10 or y1 - y0 < 10:
+            return 0, 0, w, h
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _windows(self):
+        p = os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Themes\TranscodedWallpaper")
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            return None
+        if self.windows_cache[0] != mt:
+            with Image.open(p) as im:
+                pequena = im.convert("RGB").resize((self.LARGURA, self.ALTURA),
+                                                   Image.Resampling.BOX)
+            self.windows_cache = (mt, pequena)
+        return self.windows_cache[1]
+
+    def capturar(self, qual="principal"):
+        """Devolve (imagem 192×108, fonte) ou (None, motivo)."""
+        antigo = u32.SetThreadDpiAwarenessContext(PER_MONITOR_V2)
+        try:
+            agora = time.monotonic()
+            if (not self.hwnd or agora - self.hwnd_t > 2 or not u32.IsWindow(self.hwnd)):
+                self.hwnd, self.hwnd_t = _janela_wallpaper_engine(), agora
+            if self.hwnd:
+                r = W.RECT()
+                u32.GetClientRect(self.hwnd, ctypes.byref(r))
+                w, h = r.right, r.bottom
+                if w > 0 and h > 0:
+                    mem = self._buffers(self.hwnd, w, h)
+                    if u32.PrintWindow(self.hwnd, mem, 0):
+                        x, y, cw, ch = self._regiao(self.hwnd, w, h, qual)
+                        g32.StretchBlt(self.mem_p, 0, 0, self.LARGURA, self.ALTURA,
+                                       mem, x, y, cw, ch, SRCCOPY)
+                        g32.GetDIBits(self.mem_p, self.bmp_p, 0, self.ALTURA, self.buf,
+                                      ctypes.byref(self.bmi), 0)
+                        img = Image.frombuffer("RGB", (self.LARGURA, self.ALTURA), self.buf,
+                                               "raw", "BGRX", 0, 1).copy()
+                        return img, "Wallpaper Engine"
+                self.hwnd = None                     # falhou: procura de novo
+            img = self._windows()
+            if img is not None:
+                return img, "Windows"
+            return None, "papel de parede não encontrado"
+        finally:
+            if antigo:
+                u32.SetThreadDpiAwarenessContext(antigo)
 
 
 # ------------------------------------------------------------- escolha da cor

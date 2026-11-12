@@ -20,7 +20,9 @@ from tkinter import colorchooser
 import pystray
 from PIL import Image, ImageDraw
 
-from papel_parede import capturar, cor_para_leds, cores_por_led, preparar_layout, reduzir
+from PIL import ImageChops, ImageStat
+
+from papel_parede import Capturador, cor_para_leds, cores_por_led, preparar_layout
 from rgb_core import PASTA, Controlador, log
 
 CONFIG = os.path.join(PASTA, "config.json")
@@ -103,6 +105,8 @@ class Trabalhador(threading.Thread):
     """
 
     FPS = 12
+    FPS_PARADO = 4            # quando a imagem não muda (papel estático, jogo em tela cheia)
+    LIMIAR_IMAGEM = 0.6       # diferença média mínima (0..255) para considerar que mudou
     SUAVIDADE = 0.35          # 0..1: quanto cada quadro novo pesa (menos = mais suave)
     GERAL_A_CADA = 2.0        # s, cor geral (MSI + janela)
     LIMIAR_GERAL = 20
@@ -119,30 +123,46 @@ class Trabalhador(threading.Thread):
         self._geral_t = 0.0
         self._geral_enviada = None
         self._erro_t = 0.0
+        self._cap = None
+        self._img_anterior = None
+        self._estavel = False
+        self._enviado = {}
+        self._parado = 0
+        self._primeiro = False
+        self._forcar_envio = True
 
     def ativar_papel(self, monitor, brilho):
         self.papel = {"monitor": monitor, "brilho": brilho}
         self._geral_t = 0.0               # força atualizar MSI/janela já
         self._geral_enviada = None
         self._primeiro = True
+        self._forcar_envio = True
+        self._parado = 0
         self.fila.put(("acordar", None))  # sai da espera longa e começa já
 
     def ajustar_brilho(self, brilho):
         if self.papel:
             self.papel = {**self.papel, "brilho": brilho}
-            self._geral_enviada = None    # MSI pega o brilho novo na próxima rodada
+            self._geral_enviada = None
+            self._forcar_envio = True
+            self._parado = 0    # MSI pega o brilho novo na próxima rodada
 
     def run(self):
         status = self.ctrl.conectar()
         self.ao_status("conexao", status)
         tentativas, ultima_tentativa = 0, time.monotonic()
         while True:
-            espera = 1 / self.FPS if self.papel else 10
+            if not self.papel:
+                espera = 10
+            elif self._parado >= self.FPS:          # ~1 s sem mudança: olha só 4x/s
+                espera = 1 / self.FPS_PARADO
+            else:
+                espera = 1 / self.FPS
             try:
                 cmd, arg = self.fila.get(timeout=espera)
             except queue.Empty:
                 if self.papel:
-                    self._quadro()
+                    self._parado = self._parado + 1 if self._quadro() else 0
                 # No boot o iCUE pode subir depois do app: tenta de novo a cada 10 s.
                 if (any(v != "ok" for v in status.values()) and tentativas < RETENTATIVAS
                         and time.monotonic() - ultima_tentativa > 10):
@@ -165,42 +185,65 @@ class Trabalhador(threading.Thread):
 
     # ---- modo papel de parede
     def _quadro(self):
+        """Um quadro do modo ao vivo. Devolve True se a imagem estava parada."""
         cfg = self.papel
         if not cfg:
-            return
+            return True
         try:
-            img, fonte = capturar(cfg["monitor"])
-            if img is None:
+            if self._cap is None:
+                self._cap = Capturador()
+            peq, fonte = self._cap.capturar(cfg["monitor"])
+            if peq is None:
                 if time.monotonic() - self._geral_t > self.GERAL_A_CADA:
                     self._geral_t = time.monotonic()
                     self.ao_status("papel_info", fonte)
-                return
-            peq = reduzir(img)
-            k = cfg["brilho"] / 100
+                return True
 
+            # Imagem igual à anterior (papel estático, Wallpaper Engine pausado no jogo)
+            # e LEDs já assentados: não há nada a fazer neste quadro.
+            ant = self._img_anterior
+            self._img_anterior = peq
+            mudou = (ant is None or max(ImageStat.Stat(ImageChops.difference(ant, peq)).mean)
+                     > self.LIMIAR_IMAGEM)
+            if not mudou and self._estavel and not self._forcar_envio:
+                return True
+
+            k = cfg["brilho"] / 100
             cors = self.ctrl.corsair()
             if cors:
                 if self._layouts_de is not cors.posicoes:
                     self._layouts = {d: preparar_layout(pos)
                                      for d, (_, pos) in cors.posicoes.items() if pos}
                     self._layouts_de = cors.posicoes
-                    self._suave = {}
+                    self._suave, self._enviado = {}, {}
                 a = self.SUAVIDADE
+                estavel = True
                 mapa = {}
                 for dev_id, lay in self._layouts.items():
-                    leds = []
-                    for led_id, cor in cores_por_led(peq, lay):
-                        ant = self._suave.get((dev_id, led_id))
-                        if ant is not None:
-                            cor = tuple(p + (c - p) * a for p, c in zip(ant, cor))
-                        self._suave[(dev_id, led_id)] = cor
-                        leds.append((led_id, tuple(round(c * k) for c in cor)))
-                    mapa[dev_id] = leds
-                cors.aplicar_por_led(mapa)
-                if getattr(self, "_primeiro", False):
+                    leds, mudou_disp = [], False
+                    for led_id, alvo in cores_por_led(peq, lay):
+                        chave = (dev_id, led_id)
+                        ant_c = self._suave.get(chave)
+                        cor = alvo if ant_c is None else tuple(
+                            p + (c - p) * a for p, c in zip(ant_c, alvo))
+                        if max(abs(c - t) for c, t in zip(cor, alvo)) > 1:
+                            estavel = False          # ainda deslizando até o alvo
+                        self._suave[chave] = cor
+                        final = tuple(round(c * k) for c in cor)
+                        if self._enviado.get(chave) != final:
+                            mudou_disp = True
+                            self._enviado[chave] = final
+                        leds.append((led_id, final))
+                    if mudou_disp or self._forcar_envio:
+                        mapa[dev_id] = leds
+                if mapa:
+                    cors.aplicar_por_led(mapa)
+                self._estavel = estavel
+                if self._primeiro:
                     self._primeiro = False
                     log.info("papel de parede ao vivo: %s, %s",
                              fonte, {d: f"{l[0]}x{l[1]}" for d, l in self._layouts.items()})
+            self._forcar_envio = False
 
             agora = time.monotonic()
             if agora - self._geral_t >= self.GERAL_A_CADA:
@@ -211,10 +254,12 @@ class Trabalhador(threading.Thread):
                     self._geral_enviada = geral
                     self.ctrl.aplicar(*(round(c * k) for c in geral), so_msi=True)
                     self.ao_status("papel_cor", (geral, fonte))
+            return not mudou
         except Exception:
             if time.monotonic() - self._erro_t > 30:     # não lotar o log
                 self._erro_t = time.monotonic()
                 log.exception("falha no quadro do papel de parede")
+            return False
 
 
 # ------------------------------------------------------------- janela + bandeja

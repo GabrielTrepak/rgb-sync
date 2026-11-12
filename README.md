@@ -12,7 +12,9 @@ Corsair e MSI, usando só as APIs oficiais dos fabricantes.
 ## Modos
 
 - **Cor fixa** — escolha uma cor (ou um preset) e o PC inteiro fica nela.
-- **Seguir papel de parede** — ao vivo (~12 quadros/s, ~0,3% de CPU). Na Corsair,
+- **Seguir papel de parede** — ao vivo (~12 quadros/s, ~0,1% de CPU com papel de parede
+  em vídeo; quando a imagem para — papel estático ou Wallpaper Engine pausado num jogo —
+  ele só confere 4×/s e não reenvia nada). Na Corsair,
   **cada LED recebe a cor da região do papel de parede que corresponde à posição física
   dele** (ex.: cada pente de RAM vira uma faixa vertical da tela, em degradê; as fans do
   hub LINK pegam pedaços da esquerda para a direita). A MSI, que só aceita uma cor por

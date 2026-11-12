@@ -79,6 +79,7 @@ class Corsair:
         self.dispositivos = []   # [(device_id, modelo, [led_ids])]
         self.posicoes = {}
         self.chaves = {}         # device_id -> "corsair:<modelo>"
+        self.subs = {}
         self.desligados = set()  # chaves que o usuário tirou da sincronização
         self.erro = None
 
@@ -89,6 +90,7 @@ class Corsair:
         self.posicoes = {}       # device_id -> (modelo, [(led_id, cx, cy)])
         self.chaves = {}
         self._controlados = set()
+        self.subs = {}           # hub: aparelhos da corrente
         self.sdk = CueSdk()
         ok = threading.Event()
 
@@ -118,8 +120,33 @@ class Corsair:
             self.dispositivos.append((d.device_id, d.model, ids))
             self.posicoes[d.device_id] = (d.model, posicoes)
             log.info("Corsair: %s, %d LEDs", d.model, len(ids))
+            if d.channel_count and d.type in (CorsairDeviceType.CDT_LedController,
+                                              CorsairDeviceType.CDT_FanLedController):
+                self._ler_corrente(d.device_id, ids)          # hubs (ex.: iCUE LINK)
         self._aplicar_controle()
         return True
+
+    def _ler_corrente(self, dev_id, ids):
+        """Hubs (ex.: iCUE LINK): quais aparelhos há na corrente, na ordem dos cabos,
+        e quantos LEDs cada um tem → self.subs[dev_id] = [(tipo, n, [led_ids])]."""
+        from cuesdk import CorsairDevicePropertyId as P
+        try:
+            qtds, _ = self.sdk.read_device_property(dev_id, P.CDPI_ChannelDeviceLedCountArray, 0)
+            tipos, _ = self.sdk.read_device_property(dev_id, P.CDPI_ChannelDeviceTypeArray, 0)
+            qtds = list(qtds.value) if qtds else []
+            tipos = list(tipos.value) if tipos else [0] * len(qtds)
+            ordenados = sorted(ids, key=lambda i: (i >> 16, i & 0xFFFF))
+            if sum(qtds) != len(ordenados):
+                log.warning("Corsair: corrente não bate (%s vs %d LEDs)", qtds, len(ordenados))
+                return
+            subs, k = [], 0
+            for tipo, n in zip(tipos, qtds):
+                subs.append((tipo, n, ordenados[k:k + n]))
+                k += n
+            self.subs[dev_id] = subs
+            log.info("Corsair: corrente do hub: %s", [(t, n) for t, n, _ in subs])
+        except Exception:
+            log.exception("Corsair: falha ao ler a corrente do hub")
 
     def _aplicar_controle(self):
         """Controle exclusivo SÓ de iluminação nos aparelhos ligados: os efeitos do

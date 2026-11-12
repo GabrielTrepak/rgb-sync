@@ -394,8 +394,28 @@ def realcar(rgb):
     return tuple(round(c * 255) for c in colorsys.hsv_to_rgb(h, s, v))
 
 
+def preparar_pontos(pontos):
+    """Layout por posição exata: pontos = [(led_id, x, y)] com x, y de 0 a 1.
+    (usado pro gabinete: cada LED pega o pedaço da imagem onde a fan fica de verdade)"""
+    return ("pontos", 0, list(pontos))
+
+
+def x_do_led(layout, led):
+    """Posição horizontal (0..1) de um LED do layout (para a onda etc.)."""
+    if layout[0] == "pontos":
+        return led[1]
+    ncol = layout[0]
+    return led[1] / (ncol - 1) if ncol > 1 else 0.5
+
+
 def cores_por_led(img_pequena, layout):
     """Devolve [(led_id, (r, g, b))] para um dispositivo."""
+    if layout[0] == "pontos":
+        w, h = 48, 27                     # cada ponto = média de uma região pequena
+        px = img_pequena.resize((w, h), Image.Resampling.BOX).load()
+        return [(i, realcar(px[min(w - 1, max(0, int(x * w))),
+                               min(h - 1, max(0, int(y * h)))]))
+                for i, x, y in layout[2]]
     ncol, nlin, leds = layout
     grade = img_pequena.resize((ncol, nlin), Image.Resampling.BOX)
     px = grade.load()

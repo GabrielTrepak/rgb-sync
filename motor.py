@@ -21,7 +21,9 @@ import time
 from PIL import ImageChops, ImageStat
 
 import efeitos
-from papel_parede import Capturador, cor_para_leds, cores_por_led, preparar_layout
+import gabinete
+from papel_parede import (Capturador, cor_para_leds, cores_por_led, preparar_layout,
+                          preparar_pontos, x_do_led)
 from rgb_core import DADOS, Controlador, _pasta_appdata, log
 
 CONFIG = os.path.join(DADOS, "config.json")
@@ -297,6 +299,9 @@ class Trabalhador(threading.Thread):
         self._forcar_envio = True
         self._preview_t = 0.0
         self.efeito = None            # {"tipo", "cor", "velocidade", "brilho", "fonte"} ou None
+        self.mapa_hub = {}            # {indice na corrente: papel no gabinete}
+        self._mapa_versao = 0
+        self._identificar_ate = 0.0
         self._efeito_msi = None       # parâmetros do efeito nativo já enviado à MSI
         self._efeito_t0 = time.monotonic()
         self._sensores = None
@@ -305,6 +310,22 @@ class Trabalhador(threading.Thread):
         self._temp_msi_t = 0.0
 
     # ---- comandos vindos da interface (thread da interface)
+    def definir_mapa_hub(self, mapa):
+        self.mapa_hub = {int(k): v for k, v in mapa.items()}
+        self._mapa_versao += 1
+        self._forcar_envio = True
+        self._parado = 0
+        self.fila.put(("mapa", None))
+
+    def identificar(self, segundos=30):
+        """Acende cada aparelho da corrente do hub numa cor (pra achar quem é quem)."""
+        self._identificar_ate = time.monotonic() + segundos
+        self.fila.put(("acordar", None))
+
+    def parar_identificar(self):
+        self._identificar_ate = 0.0
+        self.fila.put(("fim_identificar", None))
+
     def ativar_efeito(self, params):
         """params: {"tipo", "cor": (r, g, b), "velocidade", "brilho", "fonte"}."""
         self.papel = None
@@ -371,7 +392,10 @@ class Trabalhador(threading.Thread):
             lento = bool(self._cap and self._cap.lento)
             fps = self.FPS_CENA if lento else self.FPS
             fps_parado = self.FPS_CENA_PARADO if lento else self.FPS_PARADO
-            if self.efeito:
+            identificando = time.monotonic() < self._identificar_ate
+            if identificando:
+                espera = 0.25
+            elif self.efeito:
                 espera = 1 / (self.FPS_TEMPERATURA if self.efeito["tipo"] == "temperatura"
                               else self.FPS_EFEITO)
             elif not self.papel:
@@ -383,7 +407,11 @@ class Trabalhador(threading.Thread):
             try:
                 cmd, arg = self.fila.get(timeout=espera)
             except queue.Empty:
-                if self.efeito:
+                if identificando:
+                    self._quadro_identificar()
+                    if time.monotonic() >= self._identificar_ate:
+                        self._fim_identificar()
+                elif self.efeito:
                     self._quadro_efeito()
                 elif self.papel:
                     self._parado = self._parado + 1 if self._quadro() else 0
@@ -409,6 +437,12 @@ class Trabalhador(threading.Thread):
                 self.ao_status("resultado", self.ctrl.aplicar(*arg))
             elif cmd == "restaurar":
                 self.ao_status("restaurar", self.ctrl.restaurar_msi())
+            elif cmd == "mapa":
+                self._layouts_de = None
+                self._anunciar_layouts()
+                self._reenviar()
+            elif cmd == "fim_identificar":
+                self._fim_identificar()
             elif cmd == "desligados":
                 self.ctrl.definir_desligados(arg)
                 self.ao_status("dispositivos", self.ctrl.listar())
@@ -425,10 +459,18 @@ class Trabalhador(threading.Thread):
 
     def _anunciar_layouts(self):
         """Manda pra interface o desenho de cada dispositivo (para a prévia)."""
-        lista, teclado = [], None
+        lista, teclado, gab = [], None, None
         for be in self.ctrl.por_led():
             for dev_id, (modelo, pos) in be.posicoes.items():
                 if not pos:
+                    continue
+                subs = getattr(be, "subs", {}).get(dev_id)
+                if subs:                                   # hub: desenho do gabinete
+                    mapa = self._mapa_de(subs)
+                    gab = {"dev_id": dev_id, "chave": be.chaves[dev_id],
+                           "ativo": be.ativo(dev_id), "modelo": modelo,
+                           "desenho": gabinete.desenho_hub(subs, mapa),
+                           "subs": [(t, n) for t, n, _ in subs], "mapa": mapa}
                     continue
                 if getattr(be, "desenho", None):          # teclado: desenho próprio
                     teclado = {"dev_id": dev_id, "chave": be.chaves[dev_id],
@@ -439,13 +481,45 @@ class Trabalhador(threading.Thread):
                               be.ativo(dev_id)))
         msi = [(d["nome"].split(" (")[0], d["chave"], d["ativo"])
                for d in self.ctrl.listar() if d["marca"] == "MSI"]
-        self.ao_status("layouts", {"corsair": lista, "msi": msi, "teclado": teclado})
+        self.ao_status("layouts", {"corsair": lista, "msi": msi, "teclado": teclado,
+                                   "gabinete": gab})
+
+    # ---- gabinete
+    def _mapa_de(self, subs):
+        mapa = gabinete.mapa_padrao(subs)
+        mapa.update({i: p for i, p in self.mapa_hub.items() if i < len(subs)})
+        return mapa
+
+    def _layout_de(self, be, dev_id, pos):
+        subs = getattr(be, "subs", {}).get(dev_id)
+        if subs:      # hub: cada LED no anel da sua fan, no lugar real do gabinete
+            pts = gabinete.posicoes_hub(subs, self._mapa_de(subs))
+            return preparar_pontos([(i, x / 1000, y / 1000) for i, x, y in pts])
+        return preparar_layout(pos)
+
+    def _quadro_identificar(self):
+        cors = self.ctrl.corsair()
+        if not cors:
+            return
+        mapa = {}
+        for dev_id, subs in cors.subs.items():
+            leds = []
+            for i, (_t, _n, ids) in enumerate(subs):
+                cor = hex_rgb(gabinete.CORES_ID[i % len(gabinete.CORES_ID)])
+                leds.extend((led, cor) for led in ids)
+            mapa[dev_id] = leds
+        cors.aplicar_por_led(mapa)
+
+    def _fim_identificar(self):
+        self._identificar_ate = 0.0
+        self.ao_status("identificar_fim", None)
+        self._reenviar()
 
     # ---- efeitos
     def _garantir_layouts(self, backends):
-        assinatura = tuple(id(be.posicoes) for be in backends)
+        assinatura = tuple(id(be.posicoes) for be in backends) + (self._mapa_versao,)
         if self._layouts_de != assinatura:
-            self._layouts = {d: (be, preparar_layout(pos)) for be in backends
+            self._layouts = {d: (be, self._layout_de(be, d, pos)) for be in backends
                              for d, (_, pos) in be.posicoes.items() if pos}
             self._layouts_de = assinatura
             self._suave, self._enviado = {}, {}
@@ -472,13 +546,13 @@ class Trabalhador(threading.Thread):
             backends = self.ctrl.por_led()
             self._garantir_layouts(backends)
             mapas = {}
-            for dev_id, (be, (ncol, _nlin, leds)) in self._layouts.items():
+            for dev_id, (be, lay) in self._layouts.items():
                 if not be.ativo(dev_id):
                     continue
                 lista = []
-                for led_id, c, _l in leds:
-                    x = c / (ncol - 1) if ncol > 1 else 0.5
-                    cor = efeitos.cor_led(tipo, t, x, ef["cor"], vel, valor_n)
+                for led in lay[2]:
+                    led_id = led[0]
+                    cor = efeitos.cor_led(tipo, t, x_do_led(lay, led), ef["cor"], vel, valor_n)
                     final = tuple(round(min(255, c_) * k) for c_ in cor)
                     lista.append((led_id, final))
                     self._enviado[(dev_id, led_id)] = final
@@ -545,12 +619,7 @@ class Trabalhador(threading.Thread):
             k = cfg["brilho"] / 100
             backends = self.ctrl.por_led()           # Corsair e teclado
             if backends:
-                assinatura = tuple(id(be.posicoes) for be in backends)
-                if self._layouts_de != assinatura:
-                    self._layouts = {d: (be, preparar_layout(pos)) for be in backends
-                                     for d, (_, pos) in be.posicoes.items() if pos}
-                    self._layouts_de = assinatura
-                    self._suave, self._enviado = {}, {}
+                self._garantir_layouts(backends)
                 a = self.SUAVIDADE
                 estavel = True
                 mapas = {}

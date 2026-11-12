@@ -25,13 +25,14 @@ from PIL import Image
 
 import busca
 import efeitos
+import gabinete
 import motor
 import perfis
 from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.4"
+VERSAO = "3.5"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -103,6 +104,9 @@ class Previa(tk.Canvas):
         self.itens, self.msi, self.todos = {}, [], []
         w = int(self["width"])
         y = 4
+        gab = layouts.get("gabinete")
+        if gab:
+            y = self._montar_gabinete(gab, layouts, w, y)
         fitas = [l for l in layouts["corsair"] if l[3] == 1 and l[2] > 4]
         blocos = [l for l in layouts["corsair"] if l not in fitas]
         for dev_id, modelo, ncol, nlin, leds, _chave, ativo in fitas:
@@ -128,6 +132,9 @@ class Previa(tk.Canvas):
                                           fill="#333" if ativo else CINZA_OFF)
                 self._item(i, ativo, (tec["dev_id"], idx))
             y += 6.25 * u + 14
+        if gab:                     # RAM/headset/MSI já foram desenhados ao lado do gabinete
+            self.configure(height=y)
+            return
         x, topo, alt = 0, y, 92
         for dev_id, modelo, ncol, nlin, leds, _chave, ativo in blocos:
             nome = _nome_amigavel(modelo)
@@ -164,6 +171,59 @@ class Previa(tk.Canvas):
                              font=("Segoe UI", 10))
             y = 60
         self.configure(height=y)
+
+    def _montar_gabinete(self, gab, layouts, w, y):
+        """Gabinete visto pelo vidro (fans como anéis de LED nos lugares reais) e, ao lado,
+        RAM, headset e as zonas da MSI. Devolve o y logo abaixo."""
+        ativo = gab["ativo"]
+        GW = 262
+        GH = GW * gabinete.ALTURA
+        self._rotulo(0, y, "Gabinete (vista pelo vidro)", ativo, anchor="nw")
+        y += 18
+        topo = y
+        self.create_rectangle(1, y, GW, y + GH, outline="#3a353d", width=2)
+        self.create_rectangle(GW * 0.40, y + GH * 0.22, GW * 0.66, y + GH * 0.80,
+                              outline="#2c282f", width=1)                   # placa-mãe
+        self.create_text(4, y + GH - 4, text="trás", anchor="sw", fill=APAGADO,
+                         font=("Segoe UI", 8))
+        self.create_text(GW - 4, y + GH - 4, text="frente", anchor="se", fill=APAGADO,
+                         font=("Segoe UI", 8))
+        for _i, _papel, leds in gab["desenho"]:
+            for led, lx, ly in leds:
+                cx, cy = lx * GW, y + ly * GH
+                it = self.create_oval(cx - 2.6, cy - 2.6, cx + 2.6, cy + 2.6, outline="",
+                                      fill="#333" if ativo else CINZA_OFF)
+                self._item(it, ativo, (gab["dev_id"], led))
+        # coluna da direita
+        bx, by = GW + 18, topo + 4
+        xx = bx
+        blocos = [l for l in layouts["corsair"] if not (l[3] == 1 and l[2] > 4)]
+        for dev_id, modelo, ncol, nlin, leds, _chave, at in blocos:
+            vazio = "#333" if at else CINZA_OFF
+            if ncol * nlin == 1:
+                it = self.create_oval(xx + 6, by + 22, xx + 36, by + 52, outline="", fill=vazio)
+                self._item(it, at, (dev_id, leds[0][0]))
+                self._rotulo(xx + 21, by + 82, "Headset", at)
+                xx += 58
+            else:
+                bw, gap, ch = 11, 6, 70 / nlin
+                for led_id, c, l in leds:
+                    x0 = xx + 6 + c * (bw + gap)
+                    it = self.create_rectangle(x0, by + l * ch, x0 + bw, by + (l + 1) * ch - 1,
+                                               outline="", fill=vazio)
+                    self._item(it, at, (dev_id, led_id))
+                self._rotulo(xx + 6 + (ncol * (bw + gap) - gap) / 2, by + 82, "RAM", at)
+                xx += ncol * (bw + gap) + 24
+        mx, my = bx, by + 100
+        for nome, _chave, at in layouts["msi"]:
+            it = self.create_rectangle(mx + 4, my, mx + 40, my + 36, outline="",
+                                       fill="#333" if at else CINZA_OFF)
+            if at:
+                self.msi.append(it)
+                self.todos.append(it)
+            self._rotulo(mx + 22, my + 48, "GPU" if "vídeo" in nome else "Placa-mãe", at)
+            mx += 62
+        return max(y + GH, my + 58) + 12
 
     def tudo(self, hexa):
         for i in self.todos:
@@ -223,6 +283,7 @@ class App:
 
         self.trab = motor.Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d),
                                       desligados=self.cfg["desligados"])
+        self.trab.mapa_hub = {int(k): v for k, v in self.cfg.get("mapa_hub", {}).items()}
         self.trab.start()
         self._atualizar_modo()
         self.atalhos = perfis.Atalhos(lambda i: root.after(0, self._atalho, i))
@@ -440,6 +501,20 @@ class App:
                      font=("Segoe UI", 11)).pack(anchor="w", padx=4)
 
         # outros equipamentos
+        self.c_gab = self._cartao(p, "Cooler e fans no gabinete")
+        lg = ctk.CTkFrame(self.c_gab, fg_color="transparent")
+        lg.pack(fill="x", padx=16, pady=(6, 2))
+        ctk.CTkLabel(lg, text="Diga onde fica cada um (cores do “Identificar”).",
+                     text_color=SUAVE, font=("Segoe UI", 10)).pack(side="left")
+        self.bt_ident = self._botao(lg, "Identificar (30 s)", self.identificar, width=130)
+        self.bt_ident.pack(side="right")
+        self.lista_gab = ctk.CTkFrame(self.c_gab, fg_color="transparent")
+        self.lista_gab.pack(fill="x", padx=12, pady=(4, 2))
+        ctk.CTkLabel(self.c_gab, text="Fans que o hub não reconhece (ex.: a RX120 traseira) não "
+                     "aparecem aqui e mantêm a luz padrão delas.", text_color=APAGADO,
+                     font=("Segoe UI", 10), wraplength=LARGURA - 40, justify="left").pack(
+            anchor="w", padx=16, pady=(0, 10))
+
         c2 = self._cartao(p, "Equipamentos RGB conectados")
         self.lista_outros = ctk.CTkFrame(c2, fg_color="transparent")
         self.lista_outros.pack(fill="x", padx=12, pady=(4, 2))
@@ -754,6 +829,58 @@ class App:
                     except Exception:
                         pass
 
+    # ---- gabinete
+    NOMES_TIPO = {9: "Cooler (bomba)", 12: "Fan QX"}
+
+    def _mostrar_gabinete(self, gab):
+        for w in self.lista_gab.winfo_children():
+            w.destroy()
+        if not gab:
+            self.c_gab.pack_forget()
+            return
+        opcoes = list(gabinete.NOMES.values())
+        nfan = 0
+        for i, (tipo, n) in enumerate(gab["subs"]):
+            if tipo != gabinete.TIPO_COOLER:
+                nfan += 1
+            nome = self.NOMES_TIPO.get(tipo, "Aparelho")
+            if tipo != gabinete.TIPO_COOLER:
+                nome += f" {nfan}"
+            cor = gabinete.CORES_ID[i % len(gabinete.CORES_ID)]
+            f = ctk.CTkFrame(self.lista_gab, fg_color="transparent")
+            f.pack(fill="x", pady=2)
+            ctk.CTkFrame(f, width=16, height=16, corner_radius=8, fg_color=cor).pack(
+                side="left", padx=(4, 8))
+            ctk.CTkLabel(f, text=f"{nome}", text_color=TEXTO, font=("Segoe UI", 12)).pack(
+                side="left")
+            ctk.CTkLabel(f, text=f"  {gabinete.NOMES_CORES_ID[i % 8]} · {n} LEDs",
+                         text_color=SUAVE, font=("Segoe UI", 10)).pack(side="left")
+            var = ctk.StringVar(value=gabinete.NOMES[gab["mapa"][i]])
+            ctk.CTkOptionMenu(f, values=opcoes, variable=var, width=150, height=26,
+                              fg_color="#2a272d", button_color="#36323a",
+                              button_hover_color="#443d42", text_color=TEXTO,
+                              font=("Segoe UI", 11), dropdown_font=("Segoe UI", 11),
+                              command=lambda v, i=i: self._mudar_posicao(i, v)).pack(
+                side="right", padx=4)
+
+    def _mudar_posicao(self, indice, nome):
+        papel = next(k for k, v in gabinete.NOMES.items() if v == nome)
+        self.cfg.setdefault("mapa_hub", {})[str(indice)] = papel
+        self._salvar()
+        self.trab.definir_mapa_hub(self.cfg["mapa_hub"])
+
+    def identificar(self):
+        if getattr(self, "_identificando", False):
+            self.trab.parar_identificar()
+            return
+        self._identificando = True
+        self.bt_ident.configure(text="Parar", fg_color=DESTAQUE, text_color="#1a0d05")
+        self.trab.identificar(30)
+
+    def _fim_identificar_ui(self):
+        self._identificando = False
+        self.bt_ident.configure(text="Identificar (30 s)", fg_color="#2a272d", text_color=TEXTO)
+
     def _alternar(self, chave, ligado):
         deslig = set(self.cfg["desligados"])
         (deslig.discard if ligado else deslig.add)(chave)
@@ -958,6 +1085,8 @@ class App:
             self.enviar()
         elif verbo == "cor" and len(arg.lstrip("#")) == 6:
             self.definir("#" + arg.lstrip("#").lower())
+        elif verbo == "identificar":
+            self.identificar()
         elif verbo == "brilho" and arg.isdigit():
             self.sl_brilho.set(min(100, int(arg)))
             self._mudar_brilho(min(100, int(arg)))
@@ -1102,7 +1231,10 @@ class App:
             self._mostrar_dispositivos(dados)
         elif tipo == "recarregado":
             self.bt_resync.configure(state="normal", text="⟳  Sincronizar tudo de novo")
+        elif tipo == "identificar_fim":
+            self._fim_identificar_ui()
         elif tipo == "layouts":
+            self._mostrar_gabinete(dados.get("gabinete"))
             self.previa.montar(dados)
             self._atualizar_modo()
             self._visivel(self.root.state() != "withdrawn")

@@ -37,6 +37,16 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
     do driver NVIDIA, 35–85 °C) ou pelo **uso da CPU** (0–100%). A temperatura da CPU exigiria
     um driver de baixo nível, que o projeto evita de propósito.
 
+## Gabinete (cooler e fans no lugar certo)
+
+O hub iCUE LINK informa a corrente na ordem dos cabos (aqui: fan, fan, cooler, fan, fan, fan)
+e quantos LEDs cada um tem. Em **Dispositivos → Cooler e fans no gabinete**, "Identificar"
+acende cada um numa cor por 30 s e você escolhe a posição (topo trás/meio/frente, lateral
+cima/baixo, traseira, cooler). A partir daí cada LED do anel da fan pega o papel de parede
+**no ponto real do gabinete** (vista pelo vidro: trás à esquerda, frente à direita), a onda
+passa pelas fans na ordem física, e a prévia desenha o gabinete. Fans que o hub não
+reconhece (ex.: RX120 com o firmware atual do hub) ficam de fora.
+
 ## Controle externo (Stream Deck, scripts)
 
 ```powershell

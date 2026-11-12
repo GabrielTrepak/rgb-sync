@@ -7,7 +7,7 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
 |---|---|---|
 | Corsair | iCUE LINK Hub (H150i LCD, fans QX), Vengeance RGB DDR5, HS80 | iCUE SDK (`cuesdk`) |
 | MSI | Placa-mãe (JRGB/JARGB), placa de vídeo | Mystic Light SDK (DLL do plugin MSI do iCUE) |
-| HyperX | Alloy Origins Core | ainda não suportado |
+| HyperX | Alloy Origins Core (ANSI e ABNT2), tecla por tecla | protocolo da comunidade (OpenRGB), reescrito em `hyperx.py` — só comandos de luz |
 
 ## Modos
 
@@ -21,6 +21,9 @@ LED a LED) ou uma **cor fixa**, sincronizando Corsair e MSI pelas APIs oficiais 
   ~20 ms, por isso roda a 6 quadros/s) — sem pegar as janelas abertas por cima, e com o papel
   de parede normal do Windows. Monitor: principal, secundário ou os dois.
 - **Cor fixa** — 9 cores prontas, seletor de cor ou código hex.
+
+> **Teclado HyperX:** feche o NGENUITY (e tire ele da inicialização do Windows) — ele fica
+> reenviando a cor dele e o teclado pisca entre as duas. O app avisa se ele estiver aberto.
 
 > Se usar Wallpaper Engine, desligue o plugin de LED dele (Configurações → Plugins → LED)
 > para ele não disputar o iCUE com o RGB Sync.
@@ -73,7 +76,8 @@ No iCUE, o SDK precisa estar ativado.
 
 - `app.py` — interface (customtkinter) + bandeja (pystray) + abertura/elevação
 - `motor.py` — config, instância única, inicialização com o Windows, laço ao vivo
-- `rgb_core.py` — backends Corsair e MSI
+- `rgb_core.py` — backends Corsair, MSI e teclado HyperX
+- `hyperx.py` — protocolo e mapa de teclas (ANSI/ABNT2) do Alloy Origins Core (`python hyperx.py` testa)
 - `papel_parede.py` — captura do papel de parede e cor por LED
 - `busca.py` — procura equipamentos RGB USB (`python busca.py` testa)
 - `icone.py` — gera o ícone da fogueira (`assets/`); o da bandeja tem o núcleo na cor atual

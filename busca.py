@@ -25,8 +25,8 @@ FABRICANTES = {
 SITUACAO = {
     "Corsair": ("compativel", "Compatível — pelo iCUE"),
     "MSI": ("compativel", "Compatível — pelo Mystic Light (placa-mãe/GPU)"),
-    "HyperX": ("planejado", "Ainda não — planejado (teclado)"),
-    "HyperX / HP": ("planejado", "Ainda não — planejado (teclado)"),
+    "HyperX": ("compativel", "Compatível — teclado Alloy Origins Core"),
+    "HyperX / HP": ("compativel", "Compatível — teclado Alloy Origins Core"),
 }
 
 # Coisas desses fabricantes que não têm LED (não poluir a lista).

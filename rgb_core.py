@@ -367,10 +367,140 @@ class MSI:
         self.dll = None
 
 
+# =========================================================== HyperX (teclado, sem SDK)
+def ngenuity_aberto():
+    """O NGENUITY também fica mandando cores pro teclado → os dois brigam (pisca)."""
+    import subprocess
+    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq NGenuity*", "/FO", "CSV", "/NH"],
+                       capture_output=True, text=True, creationflags=0x08000000)
+    return "ngenuity" in r.stdout.lower()
+
+
+class HyperX:
+    """Teclado HyperX Alloy Origins Core, tecla por tecla (protocolo em hyperx.py).
+
+    O modo direto do teclado precisa ser reenviado o tempo todo, senão ele volta pro
+    perfil salvo nele: uma thread reenvia o quadro atual a cada 50 ms (≈7 ms de USB,
+    CPU desprezível). Desligado da sincronização → para de enviar e o teclado volta
+    sozinho pro perfil dele."""
+    nome = "HyperX (teclado)"
+    DEV = "hyperx:alloy-origins-core"
+    INTERVALO = 0.05
+
+    def __init__(self):
+        self.tec = None
+        self.layout = None
+        self.posicoes = {}
+        self.chaves = {}
+        self.desenho = []
+        self.dispositivos = []
+        self.desligados = set()
+        self.erro = None
+        self._cores = {}
+        self._trava = threading.Lock()
+        self._parar = threading.Event()
+        self._thread = None
+
+    def _layout_salvo(self, novo=None):
+        caminho = os.path.join(DADOS, "teclado.json")
+        if novo is not None:
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump({"layout": novo}, f)
+            return novo
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                return json.load(f)["layout"]
+        except Exception:
+            return None
+
+    def conectar(self):
+        import hyperx
+        self.dispositivos, self.posicoes, self.chaves = [], {}, {}
+        tec = hyperx.TecladoHyperX()
+        if not tec.conectar():
+            log.info("HyperX: teclado não encontrado")
+            return True                     # sem teclado não é erro
+        _resp, layout = tec.consultar()
+        if layout is None:                  # NGENUITY atrapalhando a consulta
+            layout = self._layout_salvo() or hyperx.LAYOUT_ANSI
+            log.warning("HyperX: consulta sem resposta limpa (NGENUITY aberto?); "
+                        "usando layout %s", hex(layout))
+        else:
+            self._layout_salvo(layout)
+        self.tec, self.layout = tec, layout
+        modelo = "Alloy Origins Core"
+        self.posicoes[self.DEV] = (f"HyperX {modelo}", hyperx.posicoes(layout))
+        self.chaves[self.DEV] = f"hyperx:{modelo}"
+        self.desenho = hyperx.desenho(layout)
+        n = len(self.posicoes[self.DEV][1])
+        self.dispositivos = [(self.DEV, f"HyperX {modelo}", n)]
+        log.info("HyperX: %s, layout %s, %d teclas", tec.nome,
+                 "ABNT2" if layout == hyperx.LAYOUT_ABNT2 else "ANSI", n)
+        self._parar.clear()
+        self._thread = threading.Thread(target=self._manter, daemon=True)
+        self._thread.start()
+        return True
+
+    def _manter(self):
+        while not self._parar.wait(self.INTERVALO):
+            if not self._cores or not self.ativo(self.DEV):
+                continue
+            try:
+                with self._trava:
+                    self.tec.enviar()
+            except Exception as e:
+                log.warning("HyperX: teclado parou de responder (%s)", e)
+                self._cores = {}
+                return
+
+    def ativo(self, dev_id=None):
+        return f"hyperx:Alloy Origins Core" not in self.desligados
+
+    def definir_desligados(self, chaves):
+        self.desligados = {c for c in chaves if c.startswith("hyperx:")}
+
+    def listar(self):
+        if not self.dispositivos:
+            return []
+        aviso = None
+        if ngenuity_aberto():
+            aviso = "Feche o NGENUITY — ele disputa a luz do teclado (fica piscando)"
+        return [{"chave": self.chaves[self.DEV], "nome": "HyperX Alloy Origins Core",
+                 "marca": "HyperX", "leds": self.dispositivos[0][2], "ativo": self.ativo(),
+                 "aviso": aviso,
+                 "layout": "ABNT2" if self.layout == 0x10 else "ANSI"}]
+
+    def _definir(self, cores):
+        with self._trava:
+            self._cores = cores
+            self.tec.definir(cores)
+            self.tec.enviar()
+
+    def aplicar_por_led(self, mapa):
+        leds = mapa.get(self.DEV)
+        if leds is not None and self.tec and self.ativo():
+            self._definir(dict(leds))
+
+    def aplicar(self, r, g, b):
+        if not self.tec or not self.ativo():
+            return {}
+        self._definir({i: (r, g, b) for i, _x, _y in self.posicoes[self.DEV][1]})
+        log.info("HyperX aplicar #%02x%02x%02x", r, g, b)
+        return {"Teclado HyperX": "OK"}
+
+    def desconectar(self):
+        self._parar.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self.tec:
+            self.tec.fechar()
+            self.tec = None
+
+
 # =========================================================== controlador
 class Controlador:
     def __init__(self):
-        self.backends = [Corsair(), MSI()]
+        self.backends = [Corsair(), MSI(), HyperX()]
         self.ativos = []
         self.desligados = set()      # chaves "corsair:..."/"msi:..." fora da sincronização
 
@@ -394,7 +524,7 @@ class Controlador:
         estranho). Devolve o status da conexão."""
         log.info("recarregando tudo")
         self.desconectar()
-        self.backends = [Corsair(), MSI()]
+        self.backends = [Corsair(), MSI(), HyperX()]
         return self.conectar()
 
     def conectar(self):
@@ -418,6 +548,10 @@ class Controlador:
 
     def corsair(self):
         return next((b for b in self.ativos if isinstance(b, Corsair)), None)
+
+    def por_led(self):
+        """Backends que pintam LED a LED a partir de posições (Corsair, teclado)."""
+        return [b for b in self.ativos if getattr(b, "posicoes", None)]
 
     def aplicar(self, r, g, b, so_corsair=False, so_msi=False):
         """so_corsair: passos intermediários de transição (a MSI leva ~0,6 s por

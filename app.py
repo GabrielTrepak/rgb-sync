@@ -29,7 +29,7 @@ from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.1"
+VERSAO = "3.2"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -93,7 +93,7 @@ class Previa(tk.Canvas):
         if ativo:
             self.todos.append(item)
             if chave is not None:
-                self.itens.setdefault(chave, item)
+                self.itens.setdefault(chave, []).append(item)
         return item
 
     def montar(self, layouts):
@@ -112,6 +112,20 @@ class Previa(tk.Canvas):
                                           fill="#333" if ativo else CINZA_OFF)
                 self._item(i, ativo, (dev_id, led_id))
             y += 34
+        tec = layouts.get("teclado")
+        if tec:
+            ativo = tec["ativo"]
+            self._rotulo(0, y, "Teclado", ativo, anchor="nw")
+            y += 18
+            u = w / 18.3                                    # largura de 1 tecla
+            ys = [0, 1.25, 2.25, 3.25, 4.25, 5.25]          # vão abaixo das F
+            for idx, xc, f, larg in tec["teclas"]:
+                x0 = (xc - larg / 2) * u + 1.5
+                y0 = y + ys[f] * u
+                i = self.create_rectangle(x0, y0, x0 + larg * u - 3, y0 + u - 3, outline="",
+                                          fill="#333" if ativo else CINZA_OFF)
+                self._item(i, ativo, (tec["dev_id"], idx))
+            y += 6.25 * u + 14
         x, topo, alt = 0, y, 92
         for dev_id, modelo, ncol, nlin, leds, _chave, ativo in blocos:
             nome = _nome_amigavel(modelo)
@@ -141,7 +155,7 @@ class Previa(tk.Canvas):
                 self.todos.append(i)
             self._rotulo(x + 36, topo + alt - 10, nome, ativo)
             x += 86
-        if layouts["corsair"] or layouts["msi"]:
+        if layouts["corsair"] or layouts["msi"] or layouts.get("teclado"):
             y = topo + alt
         else:
             self.create_text(w / 2, 30, text="Conectando aos dispositivos…", fill=SUAVE,
@@ -155,8 +169,7 @@ class Previa(tk.Canvas):
 
     def leds(self, cores):
         for chave, rgb in cores.items():
-            i = self.itens.get(chave)
-            if i:
+            for i in self.itens.get(chave, ()):
                 self.itemconfig(i, fill=rgb_hex(rgb))
 
     def zonas_msi(self, hexa):
@@ -424,7 +437,10 @@ class App:
                 return ctk.CTkSwitch(pai, text="", width=44, variable=var,
                                      progress_color=DESTAQUE,
                                      command=lambda: self._alternar(d["chave"], var.get()))
-            if d["marca"] == "MSI":                      # "Placa de vídeo (RTX ...)"
+            if d["marca"] == "HyperX":
+                titulo, det = "Teclado", f"{d['nome']} ({d.get('layout', '')})"
+                qtd = f"{d['leds']} teclas"
+            elif d["marca"] == "MSI":                    # "Placa de vídeo (RTX ...)"
                 titulo, _, det = d["nome"].partition(" (")
                 det = det.rstrip(")")
                 qtd = f"{d['leds']} {'zona' if d['leds'] == 1 else 'zonas'}"
@@ -436,8 +452,16 @@ class App:
                 sub += " · fora da sincronização"
             self._linha(self.lista_disp, titulo, sub, cor_sub=SUAVE if d["ativo"] else APAGADO,
                         direita=chave_sw)
-        self._linha(self.lista_disp, "Teclado HyperX", "Ainda não suportado — planejado",
-                    cor_sub=APAGADO)
+            if d.get("aviso"):
+                ctk.CTkLabel(self.lista_disp, text=f"⚠  {d['aviso']}", text_color=ALERTA,
+                             font=("Segoe UI", 10), anchor="w", wraplength=LARGURA - 60,
+                             justify="left").pack(anchor="w", padx=4, pady=(0, 4))
+                if not getattr(self, "_avisou_ngenuity", False):
+                    self._avisou_ngenuity = True
+                    try:
+                        self.icon.notify(d["aviso"], "RGB Sync — teclado")
+                    except Exception:
+                        pass
 
     def _alternar(self, chave, ligado):
         deslig = set(self.cfg["desligados"])

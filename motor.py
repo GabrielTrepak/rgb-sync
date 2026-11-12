@@ -397,17 +397,21 @@ class Trabalhador(threading.Thread):
 
     def _anunciar_layouts(self):
         """Manda pra interface o desenho de cada dispositivo (para a prévia)."""
-        cors = self.ctrl.corsair()
-        lista = []
-        if cors:
-            for dev_id, (modelo, pos) in cors.posicoes.items():
-                if pos:
-                    ncol, nlin, leds = preparar_layout(pos)
-                    lista.append((dev_id, modelo, ncol, nlin, leds, cors.chaves[dev_id],
-                                  cors.ativo(dev_id)))
+        lista, teclado = [], None
+        for be in self.ctrl.por_led():
+            for dev_id, (modelo, pos) in be.posicoes.items():
+                if not pos:
+                    continue
+                if getattr(be, "desenho", None):          # teclado: desenho próprio
+                    teclado = {"dev_id": dev_id, "chave": be.chaves[dev_id],
+                               "ativo": be.ativo(dev_id), "teclas": be.desenho}
+                    continue
+                ncol, nlin, leds = preparar_layout(pos)
+                lista.append((dev_id, modelo, ncol, nlin, leds, be.chaves[dev_id],
+                              be.ativo(dev_id)))
         msi = [(d["nome"].split(" (")[0], d["chave"], d["ativo"])
                for d in self.ctrl.listar() if d["marca"] == "MSI"]
-        self.ao_status("layouts", {"corsair": lista, "msi": msi})
+        self.ao_status("layouts", {"corsair": lista, "msi": msi, "teclado": teclado})
 
     # ---- modo papel de parede
     def _quadro(self):
@@ -433,18 +437,19 @@ class Trabalhador(threading.Thread):
                 return True
 
             k = cfg["brilho"] / 100
-            cors = self.ctrl.corsair()
-            if cors:
-                if self._layouts_de is not cors.posicoes:
-                    self._layouts = {d: preparar_layout(pos)
-                                     for d, (_, pos) in cors.posicoes.items() if pos}
-                    self._layouts_de = cors.posicoes
+            backends = self.ctrl.por_led()           # Corsair e teclado
+            if backends:
+                assinatura = tuple(id(be.posicoes) for be in backends)
+                if self._layouts_de != assinatura:
+                    self._layouts = {d: (be, preparar_layout(pos)) for be in backends
+                                     for d, (_, pos) in be.posicoes.items() if pos}
+                    self._layouts_de = assinatura
                     self._suave, self._enviado = {}, {}
                 a = self.SUAVIDADE
                 estavel = True
-                mapa = {}
-                for dev_id, lay in self._layouts.items():
-                    if not cors.ativo(dev_id):
+                mapas = {}
+                for dev_id, (be, lay) in self._layouts.items():
+                    if not be.ativo(dev_id):
                         continue
                     leds, mudou_disp = [], False
                     for led_id, alvo in cores_por_led(peq, lay):
@@ -461,19 +466,18 @@ class Trabalhador(threading.Thread):
                             self._enviado[chave] = final
                         leds.append((led_id, final))
                     if mudou_disp or self._forcar_envio:
-                        mapa[dev_id] = leds
-                if mapa:
-                    cors.aplicar_por_led(mapa)
+                        mapas.setdefault(be, {})[dev_id] = leds
+                for be, mapa in mapas.items():
+                    be.aplicar_por_led(mapa)
                 self._estavel = estavel
                 if self._primeiro:
                     self._primeiro = False
-                    log.info("papel de parede ao vivo: %s, %s",
-                             fonte, {d: f"{l[0]}x{l[1]}" for d, l in self._layouts.items()})
+                    log.info("papel de parede ao vivo: %s, %s", fonte,
+                             {d: f"{l[1][0]}x{l[1][1]}" for d, l in self._layouts.items()})
                 agora = time.monotonic()
-                if self.preview_ligado and (mapa or self._forcar_envio) \
-                        and agora - self._preview_t >= self.PREVIEW_A_CADA:
+                if self.preview_ligado and (mapas or self._forcar_envio)                         and agora - self._preview_t >= self.PREVIEW_A_CADA:
                     self._preview_t = agora
-                    self.ao_status("preview", {(d, i): c for (d, i), c in self._enviado.items()})
+                    self.ao_status("preview", dict(self._enviado))
             self._forcar_envio = False
 
             agora = time.monotonic()

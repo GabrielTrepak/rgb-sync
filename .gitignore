@@ -10,7 +10,6 @@ instalacao.log
 diagnostico_rgb.txt
 diagnostico_rgb.json
 
-# build do execut·vel
+# build do execut√°vel
 build/
 dist/
-

@@ -15,16 +15,22 @@ import math
 ALTURA = 0.62           # o gabinete (visto de lado) é mais largo que alto
 
 # papel → (x, y, raio, nome)
+# (x e raio em "larguras" do gabinete; y em "alturas"). Tudo cabe dentro da caixa,
+# contando o quadrado da fan (meio-lado ≈ 1,18 × raio).
 POSICOES = {
-    "topo_tras":     (0.30, 0.09, 0.075, "Topo — trás"),
-    "topo_meio":     (0.52, 0.09, 0.075, "Topo — meio"),
-    "topo_frente":   (0.74, 0.09, 0.075, "Topo — frente"),
-    "lateral_cima":  (0.91, 0.36, 0.075, "Lateral — cima"),
-    "lateral_baixo": (0.91, 0.66, 0.075, "Lateral — baixo"),
-    "traseira":      (0.08, 0.30, 0.070, "Traseira"),
-    "frente_baixo":  (0.74, 0.86, 0.070, "Base / frente"),
-    "bomba":         (0.30, 0.38, 0.050, "Cooler (bomba)"),
+    "topo_tras":     (0.31, 0.17, 0.068, "Topo — trás"),
+    "topo_meio":     (0.51, 0.17, 0.068, "Topo — meio"),
+    "topo_frente":   (0.71, 0.17, 0.068, "Topo — frente"),
+    "lateral_cima":  (0.875, 0.45, 0.068, "Lateral — cima"),
+    "lateral_baixo": (0.875, 0.76, 0.068, "Lateral — baixo"),
+    "traseira":      (0.085, 0.40, 0.060, "Traseira"),
+    "frente_baixo":  (0.62, 0.86, 0.060, "Base / frente"),
+    "bomba":         (0.30, 0.46, 0.046, "Cooler (bomba)"),
 }
+# Peças só de referência no desenho (x0, y0, x1, y1) em frações do gabinete
+PLACA_MAE = (0.17, 0.30, 0.62, 0.90)
+PENTES_RAM = [(0.415, 0.34, 0.428, 0.57), (0.445, 0.34, 0.458, 0.57)]
+PLACA_VIDEO = (0.18, 0.66, 0.72, 0.77)
 NOMES = {k: v[3] for k, v in POSICOES.items()}
 TIPO_COOLER = 9                 # tipo de aparelho que o hub informa para a bomba
 

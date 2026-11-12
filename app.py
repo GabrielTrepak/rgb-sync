@@ -12,6 +12,7 @@ RGB Sync — interface (janela + bandeja).
 """
 
 import ctypes
+import math
 import os
 import sys
 import threading
@@ -32,7 +33,7 @@ from icone import icone
 from motor import hex_rgb, ler_config, rgb_hex, salvar_config
 from rgb_core import PASTA, log
 
-VERSAO = "3.6"
+VERSAO = "3.7"
 ICO = os.path.join(PASTA, "assets", "rgbsync.ico")
 PNG = os.path.join(PASTA, "assets", "rgbsync.png")
 
@@ -84,6 +85,7 @@ class Previa(tk.Canvas):
     def __init__(self, master):
         super().__init__(master, width=LARGURA - 40, height=60, bg=CARTAO,
                          highlightthickness=0, bd=0)
+        self.arcos = set()     # itens que são arcos (pintados pela borda)
         self.itens = {}        # (dev_id, led_id) -> id   (só aparelhos ligados)
         self.msi = []          # ids das zonas MSI ligadas
         self.todos = []        # todos os itens ligados
@@ -99,9 +101,15 @@ class Previa(tk.Canvas):
                 self.itens.setdefault(chave, []).append(item)
         return item
 
+    def _pintar(self, it, cor):
+        if it in self.arcos:
+            self.itemconfig(it, outline=cor)
+        else:
+            self.itemconfig(it, fill=cor)
+
     def montar(self, layouts):
         self.delete("all")
-        self.itens, self.msi, self.todos = {}, [], []
+        self.itens, self.msi, self.todos, self.arcos = {}, [], [], set()
         w = int(self["width"])
         y = 4
         gab = layouts.get("gabinete")
@@ -178,22 +186,14 @@ class Previa(tk.Canvas):
         ativo = gab["ativo"]
         GW = 262
         GH = GW * gabinete.ALTURA
-        self._rotulo(0, y, "Gabinete (vista pelo vidro)", ativo, anchor="nw")
+        self._rotulo(0, y, "Gabinete", ativo, anchor="nw")
         y += 18
         topo = y
-        self.create_rectangle(1, y, GW, y + GH, outline="#3a353d", width=2)
-        self.create_rectangle(GW * 0.40, y + GH * 0.22, GW * 0.66, y + GH * 0.80,
-                              outline="#2c282f", width=1)                   # placa-mãe
-        self.create_text(4, y + GH - 4, text="trás", anchor="sw", fill=APAGADO,
-                         font=("Segoe UI", 8))
-        self.create_text(GW - 4, y + GH - 4, text="frente", anchor="se", fill=APAGADO,
-                         font=("Segoe UI", 8))
-        for _i, _papel, leds in gab["desenho"]:
-            for led, lx, ly in leds:
-                cx, cy = lx * GW, y + ly * GH
-                it = self.create_oval(cx - 2.6, cy - 2.6, cx + 2.6, cy + 2.6, outline="",
-                                      fill="#333" if ativo else CINZA_OFF)
-                self._item(it, ativo, (gab["dev_id"], led))
+
+        def reg(it, chave, _sub):
+            self.arcos.add(it)
+            self._item(it, ativo, chave)
+        GH = desenhar_gabinete(self, gab, 0, y, GW, reg, nomes=False, ativo=ativo)
         # coluna da direita
         bx, by = GW + 18, topo + 4
         xx = bx
@@ -223,78 +223,135 @@ class Previa(tk.Canvas):
                 self.todos.append(it)
             self._rotulo(mx + 22, my + 48, "GPU" if "vídeo" in nome else "Placa-mãe", at)
             mx += 62
-        return max(y + GH, my + 58) + 12
+        return max(topo + GH, my + 58) + 12
 
     def tudo(self, hexa):
         for i in self.todos:
-            self.itemconfig(i, fill=hexa)
+            self._pintar(i, hexa)
 
     def leds(self, cores):
         for chave, rgb in cores.items():
             for i in self.itens.get(chave, ()):
-                self.itemconfig(i, fill=rgb_hex(rgb))
+                self._pintar(i, rgb_hex(rgb))
 
     def zonas_msi(self, hexa):
         for i in self.msi:
             self.itemconfig(i, fill=hexa)
 
 
+def _ret_arred(cv, x0, y0, x1, y1, r, **kw):
+    """Retângulo de cantos arredondados (o Tk não tem)."""
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+           x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+NOMES_CURTOS = {"topo_tras": "trás", "topo_meio": "meio", "topo_frente": "frente",
+                "lateral_cima": "cima", "lateral_baixo": "baixo", "traseira": "traseira",
+                "frente_baixo": "base", "bomba": "cooler"}
+
+
+def desenhar_gabinete(cv, gab, x0, y0, W, registrar, nomes=True, ativo=True):
+    """Desenha o gabinete visto pelo vidro: caixa, placa-mãe com RAM, placa de vídeo,
+    fans QX (quadro + anel de luz contínuo + pás) e o cooler (bloco + tela redonda).
+    Cada LED vira um pedaço de arco do anel; registrar(item, chave, indice_sub) guarda
+    os itens pra pintar depois. Devolve a altura usada."""
+    H = W * gabinete.ALTURA
+    X = lambda f: x0 + f * W                       # noqa: E731
+    Y = lambda f: y0 + f * H                       # noqa: E731
+    _ret_arred(cv, X(0) + 1, Y(0) + 1, X(1) - 1, Y(1) - 1, 10, fill="#141217",
+               outline="#3a353d", width=2)
+    px0, py0, px1, py1 = gabinete.PLACA_MAE
+    _ret_arred(cv, X(px0), Y(py0), X(px1), Y(py1), 4, fill="#18161b", outline="#29252d")
+    for a, b, c, d in gabinete.PENTES_RAM:
+        cv.create_rectangle(X(a), Y(b), X(c), Y(d), fill="#2a262e", outline="")
+    gx0, gy0, gx1, gy1 = gabinete.PLACA_VIDEO
+    _ret_arred(cv, X(gx0), Y(gy0), X(gx1), Y(gy1), 4, fill="#1d1a20", outline="#302b33")
+    if nomes:
+        cv.create_text(X((gx0 + gx1) / 2), Y((gy0 + gy1) / 2), text="placa de vídeo",
+                       fill="#3d3840", font=("Segoe UI", 8))
+        cv.create_text(X(0.01), Y(1) + 9, text="◀ trás do gabinete", anchor="w",
+                       fill=APAGADO, font=("Segoe UI", 8))
+        cv.create_text(X(0.99), Y(1) + 9, text="frente ▶", anchor="e", fill=APAGADO,
+                       font=("Segoe UI", 8))
+    vazio = "#3a3540" if ativo else CINZA_OFF
+    for i, papel, leds in gab["desenho"]:
+        fx, fy, fr, _nome = gabinete.POSICOES.get(papel, gabinete.POSICOES["traseira"])
+        cx, cy, rr = X(fx), Y(fy), fr * W
+        cooler = papel == "bomba"
+        lado = rr * (1.10 if cooler else 1.22)
+        _ret_arred(cv, cx - lado, cy - lado, cx + lado, cy + lado, max(3, rr * 0.25),
+                   fill="#232027" if cooler else "#19171c",
+                   outline="#3a353f" if cooler else "#2b272f")
+        n = max(1, len(leds))
+        larg = max(2.0, rr * (0.22 if cooler else 0.26))
+        ext = 360 / n
+        for k, (led, _lx, _ly) in enumerate(leds):
+            centro = 90 - 360 * k / n                    # começa no topo, sentido horário
+            it = cv.create_arc(cx - rr, cy - rr, cx + rr, cy + rr, start=centro - ext / 2 - 0.6,
+                               extent=ext + 1.2, style="arc", outline=vazio, width=larg)
+            registrar(it, (gab["dev_id"], led), i)
+        if cooler:                                       # tela redonda do cooler
+            rt = rr - larg * 0.9
+            cv.create_oval(cx - rt, cy - rt, cx + rt, cy + rt, fill="#0c0b0e", outline="#2a262e")
+        else:                                            # pás e miolo da fan
+            ri = rr - larg * 0.6
+            for ang in (35, 125, 215, 305):
+                a = math.radians(ang)
+                cv.create_line(cx + math.cos(a) * rr * 0.30, cy + math.sin(a) * rr * 0.30,
+                               cx + math.cos(a) * ri, cy + math.sin(a) * ri,
+                               fill="#2a2630", width=max(1, rr * 0.10))
+            rh = rr * 0.30
+            cv.create_oval(cx - rh, cy - rh, cx + rh, cy + rh, fill="#1e1b22", outline="#3a3540")
+        if nomes:
+            if papel.startswith("lateral"):            # do lado (não encosta na de baixo)
+                cv.create_text(cx - lado - 5, cy, text=NOMES_CURTOS[papel], anchor="e",
+                               fill=SUAVE, font=("Segoe UI", 8))
+            else:
+                cv.create_text(cx, cy + lado + 7, text=NOMES_CURTOS.get(papel, papel),
+                               fill=SUAVE, font=("Segoe UI", 8))
+    return H + (18 if nomes else 0)
+
+
 class CanvasGabinete(tk.Canvas):
-    """Gabinete grande (aba Gabinete): fans e cooler como anéis de LED nos lugares reais,
-    com o nome da posição. Mostra as cores ao vivo ou as cores do "Identificar"."""
+    """Gabinete grande (aba Gabinete), ao vivo, com as cores do "Identificar"."""
 
     W = LARGURA - 40
 
     def __init__(self, master):
-        super().__init__(master, width=self.W, height=int(self.W * gabinete.ALTURA) + 30,
+        super().__init__(master, width=self.W, height=int(self.W * gabinete.ALTURA) + 20,
                          bg=CARTAO, highlightthickness=0, bd=0)
         self.itens, self.por_sub, self.todos = {}, {}, []
+
+    def _registrar(self, it, chave, sub):
+        self.itens.setdefault(chave, []).append(it)
+        self.por_sub.setdefault(sub, []).append(it)
+        self.todos.append(it)
 
     def montar(self, gab):
         self.delete("all")
         self.itens, self.por_sub, self.todos = {}, {}, []
-        W, H, y0 = self.W, self.W * gabinete.ALTURA, 6
         if not gab:
-            self.create_text(W / 2, 60, text="Nenhum hub iCUE LINK encontrado.", fill=SUAVE,
-                             font=("Segoe UI", 11))
+            self.create_text(self.W / 2, 60, text="Nenhum hub iCUE LINK encontrado.",
+                             fill=SUAVE, font=("Segoe UI", 11))
             self.configure(height=120)
             return
-        self.create_rectangle(2, y0, W - 2, y0 + H, outline="#3a353d", width=2)
-        self.create_rectangle(W * 0.40, y0 + H * 0.22, W * 0.66, y0 + H * 0.80,
-                              outline="#2c282f", width=1)
-        self.create_text(W * 0.53, y0 + H * 0.51, text="placa-mãe", fill="#3a353d",
-                         font=("Segoe UI", 9))
-        self.create_text(8, y0 + H - 6, text="◀ trás", anchor="sw", fill=APAGADO,
-                         font=("Segoe UI", 9))
-        self.create_text(W - 8, y0 + H - 6, text="frente ▶", anchor="se", fill=APAGADO,
-                         font=("Segoe UI", 9))
-        for i, papel, leds in gab["desenho"]:
-            x, y, r, nome = gabinete.POSICOES[papel]
-            for led, lx, ly in leds:
-                cx, cy = lx * W, y0 + ly * H
-                it = self.create_oval(cx - 3.8, cy - 3.8, cx + 3.8, cy + 3.8, outline="",
-                                      fill="#333")
-                self.itens.setdefault((gab["dev_id"], led), []).append(it)
-                self.por_sub.setdefault(i, []).append(it)
-                self.todos.append(it)
-            # nome da posição dentro do anel
-            self.create_text(x * W, y0 + y * H, text=nome.split(" — ")[-1].replace(
-                "Cooler (bomba)", "cooler"), fill=SUAVE, font=("Segoe UI", 8))
-        self.configure(height=int(y0 + H + 10))
+        h = desenhar_gabinete(self, gab, 0, 4, self.W, self._registrar)
+        self.configure(height=int(h + 8))
 
     def leds(self, cores):
         for chave, rgb in cores.items():
             for it in self.itens.get(chave, ()):
-                self.itemconfig(it, fill=rgb_hex(rgb))
+                self.itemconfig(it, outline=rgb_hex(rgb))
 
     def tudo(self, hexa):
         for it in self.todos:
-            self.itemconfig(it, fill=hexa)
+            self.itemconfig(it, outline=hexa)
 
     def identificacao(self):
         for i, its in self.por_sub.items():
             for it in its:
-                self.itemconfig(it, fill=gabinete.CORES_ID[i % len(gabinete.CORES_ID)])
+                self.itemconfig(it, outline=gabinete.CORES_ID[i % len(gabinete.CORES_ID)])
 
 
 class App:

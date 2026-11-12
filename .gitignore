@@ -13,3 +13,10 @@ diagnostico_rgb.json
 # build do executável
 build/
 dist/
+
+# Tuya (tinytuya wizard): chaves locais e credenciais da API — NUNCA versionar
+devices.json
+tuya-raw.json
+tinytuya.json
+snapshot.json
+snapshot.*

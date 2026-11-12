@@ -13,12 +13,14 @@ import queue
 import socket
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import colorchooser
 
 import pystray
 from PIL import Image, ImageDraw
 
+from papel_parede import capturar, cor_para_leds
 from rgb_core import PASTA, Controlador, log
 
 CONFIG = os.path.join(PASTA, "config.json")
@@ -119,8 +121,60 @@ class Trabalhador(threading.Thread):
                 cmd, arg = self.fila.get()
             if cmd == "cor":
                 self.ao_status("resultado", self.ctrl.aplicar(*arg))
+            elif cmd == "transicao":
+                self._transicao(*arg)
             elif cmd == "restaurar":
                 self.ao_status("restaurar", self.ctrl.restaurar_msi())
+
+    def _transicao(self, de, para, passos=12):
+        """Desliza a cor da Corsair suavemente (~1 s); a MSI recebe só a cor final."""
+        for i in range(1, passos):
+            if not self.fila.empty():          # chegou pedido novo: pula pro fim
+                break
+            t = i / passos
+            meio = tuple(round(a + (b - a) * t) for a, b in zip(de, para))
+            self.ctrl.aplicar(*meio, so_corsair=True)
+            time.sleep(0.08)
+        self.ao_status("resultado", self.ctrl.aplicar(*para))
+
+
+# ------------------------------------------------------------- papel de parede
+class Observador(threading.Thread):
+    """A cada 2 s olha o papel de parede e, se a cor mudou de verdade, avisa o app."""
+
+    INTERVALO = 2.0
+    LIMIAR = 20          # diferença mínima (RGB) para trocar — evita piscar em vídeo
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.forcar = threading.Event()
+
+    def run(self):
+        media, enviada = None, None
+        while True:
+            self.forcar.wait(self.INTERVALO)
+            forcado = self.forcar.is_set()
+            self.forcar.clear()
+            if self.app.cfg.get("modo") != "papel_parede":
+                media, enviada = None, None
+                continue
+            try:
+                img, fonte = capturar(self.app.cfg.get("monitor", "ambos"))
+                if img is None:
+                    self.app.root.after(0, self.app.info_papel, fonte)
+                    continue
+                cor = cor_para_leds(img)
+            except Exception:
+                log.exception("falha ao ler papel de parede")
+                continue
+            # média móvel: vídeos mudam a cada quadro, os LEDs não precisam
+            media = cor if (media is None or forcado) else tuple(
+                round(0.5 * a + 0.5 * b) for a, b in zip(media, cor))
+            dif = max(abs(a - b) for a, b in zip(media, enviada)) if enviada else 999
+            if forcado or dif > self.LIMIAR:
+                enviada = media
+                self.app.root.after(0, self.app.cor_do_papel, media, fonte)
 
 
 # ------------------------------------------------------------- janela + bandeja
@@ -128,6 +182,11 @@ class App:
     def __init__(self, root, iniciar_escondido):
         self.root = root
         self.cfg = ler_config()
+        self.cfg.setdefault("modo", "fixo")            # "fixo" | "papel_parede"
+        self.cfg.setdefault("monitor", "ambos")        # "ambos" | "principal" | "secundario"
+        # o que está nos LEDs agora (antes do brilho)
+        self.cor_atual = (self.cfg.get("cor_papel", self.cfg["cor"])
+                          if self.cfg["modo"] == "papel_parede" else self.cfg["cor"])
         self.conexao = {}
         self.pronto = False
         self.avisou_bandeja = iniciar_escondido
@@ -147,6 +206,9 @@ class App:
 
         self.trab = Trabalhador(lambda t, d: root.after(0, self.ao_status, t, d))
         self.trab.start()
+        self.obs = Observador(self)
+        self.obs.start()
+        self._atualizar_modo_ui()
 
     # ---- montagem
     def _botao(self, pai, texto, cmd, **kw):
@@ -160,6 +222,31 @@ class App:
                  font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=18, pady=(16, 2))
         tk.Label(root, text="Uma cor para o PC inteiro", bg=BG, fg=SUAVE,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=18)
+
+        # modo
+        modo = tk.Frame(root, bg=PAINEL, padx=10, pady=8)
+        modo.pack(fill="x", padx=18, pady=(12, 0))
+        self.var_modo = tk.StringVar(value=self.cfg["modo"])
+        estilo_radio = dict(bg=PAINEL, fg=TEXTO, selectcolor=BG, activebackground=PAINEL,
+                            activeforeground=TEXTO, font=("Segoe UI", 10), cursor="hand2",
+                            command=self.mudar_modo, variable=self.var_modo)
+        tk.Radiobutton(modo, text="Cor fixa", value="fixo", **estilo_radio).grid(
+            row=0, column=0, sticky="w")
+        tk.Radiobutton(modo, text="Seguir papel de parede", value="papel_parede",
+                       **estilo_radio).grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.MONITORES = {"Os dois monitores": "ambos", "Monitor principal": "principal",
+                          "Monitor secundário": "secundario"}
+        nome_mon = next(k for k, v in self.MONITORES.items() if v == self.cfg["monitor"])
+        self.var_monitor = tk.StringVar(value=nome_mon)
+        self.menu_monitor = tk.OptionMenu(modo, self.var_monitor, *self.MONITORES,
+                                          command=self.mudar_monitor)
+        self.menu_monitor.configure(bg=BG, fg=TEXTO, activebackground="#2a2a33",
+                                    activeforeground=TEXTO, relief="flat",
+                                    highlightthickness=0, font=("Segoe UI", 9))
+        self.menu_monitor["menu"].configure(bg=PAINEL, fg=TEXTO)
+        self.menu_monitor.grid(row=1, column=1, sticky="w", padx=(14, 0), pady=(4, 0))
+        self.lbl_fonte = tk.Label(modo, text="", bg=PAINEL, fg=SUAVE, font=("Segoe UI", 8))
+        self.lbl_fonte.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         topo = tk.Frame(root, bg=BG)
         topo.pack(fill="x", padx=18, pady=14)
@@ -209,8 +296,14 @@ class App:
 
         cores = pystray.Menu(*[pystray.MenuItem(nome, na_ui(self.definir, cor))
                                for nome, cor in PRESETS])
+        def alternar_papel():
+            self.var_modo.set("fixo" if self.cfg["modo"] == "papel_parede" else "papel_parede")
+            self.mudar_modo()
+
         return pystray.Menu(
             pystray.MenuItem("Abrir RGB Sync", na_ui(self.mostrar), default=True),
+            pystray.MenuItem("Seguir papel de parede", na_ui(alternar_papel),
+                             checked=lambda item: self.cfg.get("modo") == "papel_parede"),
             pystray.MenuItem("Cores", cores),
             pystray.MenuItem("Apagar tudo", na_ui(self.definir, "#000000")),
             pystray.Menu.SEPARATOR,
@@ -224,21 +317,71 @@ class App:
             self.definir(hexa)
 
     def definir(self, hexa):
+        """Cor escolhida à mão (preset, seletor, apagar) → volta pro modo cor fixa."""
         self.cfg["cor"] = hexa
+        if self.cfg["modo"] != "fixo":
+            self.cfg["modo"] = "fixo"
+            self.var_modo.set("fixo")
+            self._atualizar_modo_ui()
+        self._mostrar_cor(hexa)
+        self.enviar()
+
+    def _mostrar_cor(self, hexa):
+        self.cor_atual = hexa
         self.amostra.configure(bg=hexa)
         self.lbl_hex.configure(text=hexa.upper())
         self.icon.icon = icone_bandeja(hexa)
-        self.enviar()
+
+    def _com_brilho(self, hexa):
+        h = hexa.lstrip("#")
+        k = self.brilho.get() / 100
+        return tuple(round(int(h[i:i + 2], 16) * k) for i in (0, 2, 4))
 
     def enviar(self):
         if not self.pronto:
             return
-        h = self.cfg["cor"].lstrip("#")
-        k = self.brilho.get() / 100
-        rgb = tuple(round(int(h[i:i + 2], 16) * k) for i in (0, 2, 4))
         self.cfg["brilho"] = self.brilho.get()
         salvar_config(self.cfg)
-        self.trab.fila.put(("cor", rgb))
+        self.trab.fila.put(("cor", self._com_brilho(self.cor_atual)))
+
+    # ---- papel de parede
+    def mudar_modo(self):
+        self.cfg["modo"] = self.var_modo.get()
+        salvar_config(self.cfg)
+        self._atualizar_modo_ui()
+        if self.cfg["modo"] == "fixo":
+            self._mostrar_cor(self.cfg["cor"])
+            self.enviar()
+        else:
+            self.lbl_fonte.configure(text="lendo papel de parede…")
+            self.obs.forcar.set()
+        self.icon.update_menu()
+
+    def mudar_monitor(self, nome):
+        self.cfg["monitor"] = self.MONITORES[nome]
+        salvar_config(self.cfg)
+        self.obs.forcar.set()
+
+    def _atualizar_modo_ui(self):
+        papel = self.cfg["modo"] == "papel_parede"
+        self.menu_monitor.configure(state="normal" if papel else "disabled")
+        if not papel:
+            self.lbl_fonte.configure(text="")
+
+    def cor_do_papel(self, rgb, fonte):
+        if self.cfg["modo"] != "papel_parede":
+            return
+        hexa = "#%02x%02x%02x" % rgb
+        anterior = self._com_brilho(self.cor_atual)
+        self._mostrar_cor(hexa)
+        self.cfg["cor_papel"] = hexa
+        salvar_config(self.cfg)
+        self.lbl_fonte.configure(text=f"fonte: {fonte}")
+        if self.pronto:
+            self.trab.fila.put(("transicao", (anterior, self._com_brilho(hexa))))
+
+    def info_papel(self, texto):
+        self.lbl_fonte.configure(text=texto)
 
     def restaurar(self):
         self.trab.fila.put(("restaurar", None))

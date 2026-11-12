@@ -9,6 +9,18 @@ Corsair e MSI, usando só as APIs oficiais dos fabricantes.
 | MSI | Placa-mãe (JRGB/JARGB), placa de vídeo | Mystic Light SDK (DLL do plugin MSI do iCUE) |
 | HyperX | Alloy Origins Core | ainda não suportado |
 
+## Modos
+
+- **Cor fixa** — escolha uma cor (ou um preset) e o PC inteiro fica nela.
+- **Seguir papel de parede** — a cada 2 s o app olha o papel de parede e usa a cor
+  que mais o representa, com transição suave. Funciona com o **Wallpaper Engine**
+  (captura a janela onde ele desenha, então janelas abertas por cima não atrapalham;
+  funciona com vídeo, cena e playlist) e com o papel de parede normal do Windows.
+  Dá pra escolher os dois monitores, só o principal ou só o secundário.
+
+> Se usar Wallpaper Engine, desligue o plugin de LED dele (Configurações → Plugins → LED)
+> para ele não disputar o iCUE com o RGB Sync.
+
 ## Regras do projeto
 
 - Só mexe em **iluminação**. Ventilação e bomba continuam com o iCUE / MSI Center,
@@ -42,4 +54,5 @@ Fechar a janela só esconde o app; para sair: botão direito no ícone da bandej
 
 - `rgb_core.py` — backends Corsair e MSI + controlador
 - `app.py` — janela (tkinter) + bandeja (pystray), instância única, reconexão no boot
+- `papel_parede.py` — captura do papel de parede e escolha da cor (`python papel_parede.py` testa)
 - `rgb.log` — log local

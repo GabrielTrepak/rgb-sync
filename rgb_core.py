@@ -24,9 +24,11 @@ PASTA = os.path.dirname(os.path.abspath(__file__))
 BACKUP_MSI = os.path.join(PASTA, "msi_backup.json")
 LOG = os.path.join(PASTA, "rgb.log")
 
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
-    filename=LOG, level=logging.INFO, encoding="utf-8",
-    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[RotatingFileHandler(LOG, maxBytes=1_000_000, backupCount=1, encoding="utf-8")],
 )
 log = logging.getLogger("rgb")
 
@@ -281,9 +283,13 @@ class Controlador:
             status[b.nome] = "ok" if ok else b.erro
         return status
 
-    def aplicar(self, r, g, b):
+    def aplicar(self, r, g, b, so_corsair=False):
+        """so_corsair: usado nos passos intermediários de transição (a MSI leva
+        ~0,6 s por mudança, então ela só recebe a cor final)."""
         res = {}
         for be in self.ativos:
+            if so_corsair and not isinstance(be, Corsair):
+                continue
             try:
                 res.update(be.aplicar(r, g, b))
             except Exception as e:
